@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<!--
+Copyright 2016 The Chromium Authors. All rights reserved.
+Use of this source code is governed by a BSD-style license that can be
+found in the LICENSE file.
+-->
+
+<link rel="import" href="/tracing/base/color_scheme.html">
+<link rel="import" href="/tracing/ui/base/ui.html">
+<link rel="import" href="/tracing/ui/tracks/chart_axis.html">
+<link rel="import" href="/tracing/ui/tracks/chart_point.html">
+<link rel="import" href="/tracing/ui/tracks/chart_series.html">
+<link rel="import" href="/tracing/ui/tracks/chart_track.html">
+
+<link rel="import" href="/tracing/model/helpers/chrome_model_helper.html">
+
+<style>
+.cpu-usage-track {
+  height: 90px;
+}
+</style>
+
+<script>
+'use strict';
+
+tr.exportTo('tr.ui.tracks', function() {
+
+  var TOPLEVEL_CATEGORY_NAME = 'toplevel';
+
+  function runConditionallyOnInnermostDescendants(slice, predicate, cb) {
+    var succeededOnSomeDescendant = false;
+    for (var child of slice.subSlices) {
+      var succeededOnThisChild = runConditionallyOnInnermostDescendants(
+        child, predicate, cb);
+      succeededOnSomeDescendant =
+        succeededOnThisChild || succeededOnSomeDescendant;
+    }
+
+    if (succeededOnSomeDescendant) return true;
+
+    if (predicate(slice)) {
+      cb(slice);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  function forEachInnermostTopLevelSlices(thread, cb) {
+    var topLevelPredicate = slice => tr.b.getCategoryParts(slice.category)
+        .includes(TOPLEVEL_CATEGORY_NAME);
+
+    for (var slice of thread.sliceGroup.topLevelSlices) {
+      runConditionallyOnInnermostDescendants(slice, topLevelPredicate, cb);
+    }
+  }
+
+
+  var ColorScheme = tr.b.ColorScheme;
+  var ChartTrack = tr.ui.tracks.ChartTrack;
+  var MAX_CPU_TRACK_INTERVAL_COUNT = 100000;
+
+  /**
+   * A track that displays the cpu usage of a process.
+   *
+   * @constructor
+   * @extends {tr.ui.tracks.ChartTrack}
+   */
+  var InstantEILTrack = tr.ui.b.define('cpu-usage-track', ChartTrack);
+
+  InstantEILTrack.prototype = {
+    __proto__: ChartTrack.prototype,
+
+    DEFAULT_INTERVAL: 5,  // in ms.
+
+    decorate: function(viewport) {
+      ChartTrack.prototype.decorate.call(this, viewport);
+      this.classList.add('cpu-usage-track');
+      this.heading = 'Instant EIL';
+      this.cpuUsageSeries_ = undefined;
+    },
+
+    // Given a tr.Model, it creates a cpu usage series and a graph.
+    initialize: function(model, interval) {
+      if (interval !== undefined)
+        this.interval_ = interval;
+      else
+        this.interval_ = this.DEFAULT_INTERVAL;
+      if (model !== undefined)
+        this.cpuUsageSeries_ = this.computeCpuUsage_(model);
+      else
+        this.cpuUsageSeries_ = undefined;
+      // this.series = this.buildChartSeries_();
+      // this.autoSetAllAxes({expandMax: true});
+    },
+
+    // Given a tr.Model, it creates a cpu usage series and a graph.
+    initialize2: function(process) {
+      var model = process.model;
+      if (model !== undefined)
+        this.instantEILSeries = this.computeInstantEIL_(model, process);
+      else
+        this.instantEILSeries = undefined;
+      this.series = this.buildChartSeries_();
+      this.autoSetAllAxes({expandMax: true});
+    },
+
+    computeInstantEIL_(model, process) {
+      var modelHelper = model.getOrCreateHelper(tr.model.helpers.ChromeModelHelper);
+      var pid = process.pid;
+      var rendererHelper = modelHelper.rendererHelpers[pid];
+      if (!rendererHelper) return [];
+      var eqtSeries = [];
+      forEachInnermostTopLevelSlices(rendererHelper.mainThread, slice => {
+        eqtSeries.push([slice.start, 0]);
+        eqtSeries.push([slice.start, slice.duration]);
+        eqtSeries.push([slice.end, 0]);
+      });
+      return eqtSeries;
+    },
+
+
+    // Given a tr.Model, it returns the computation of cpu usage of all the
+    // processes.
+    computeCpuUsage_: function(model) {
+      var intervalCount = Math.ceil(model.bounds.max / this.interval_);
+      // Rather than attempting a huge allocation and having the tab crash with
+      // an out-of-memory error, throw an error here if there are too many
+      // CPU intervals to handle.
+      if (intervalCount > MAX_CPU_TRACK_INTERVAL_COUNT) {
+        throw new Error('The trace is too long or the CPU usage counter ' +
+            'interval is too small, leading to too many CPU usage intervals.');
+      }
+      var cpuUsage = undefined;
+      if (intervalCount > 0) {
+        tr.b.iterItems(model.processes, function(pid, process) {
+          // Iterate slices, find all the CPU samples which overlap. For each
+          // such CPU sample, increment it of the "average CPU usage" of the
+          // slice.
+          for (var e of process.getDescendantEvents()) {
+            if (!(e instanceof tr.model.ThreadSlice) || e.duration === 0 ||
+                e.cpuDuration === undefined) {
+              continue;
+            }
+
+            // This slice contains the most fine-grained CPU usage information
+            // for the area of the trace that it covers but that is not covered
+            // by its subslices.
+            // The math goes this way:
+            //   s.selfTime    : duration of slice s not spent in its subslices.
+            //   s.cpuSelfTime : cpuDuration over slice s but not its subslices.
+            //
+            // We're looking for
+            //   s.cpuSelfTimeRatio: average cpu usage over the area covered by
+            //                       s but not any of its subslices.
+            //                    = s.cpuSelfTime / s.selfTime
+            if (e.selfTime === 0 || e.selfTime === undefined ||
+                e.cpuSelfTime === undefined) {
+              continue;
+            }
+
+            var cpuSelfTimeRatio = e.cpuSelfTime / e.selfTime;
+            cpuSelfTimeRatio = Math.max(0, cpuSelfTimeRatio);
+            cpuSelfTimeRatio = Math.min(1, cpuSelfTimeRatio);
+            // We have found at least one valid thread slice.
+            if (cpuUsage === undefined)
+              cpuUsage = new Array(intervalCount).fill(0);
+
+            // Go through the area covered by this slice but not its subslices
+            // and add the cpuSelfTimeRatio contribution over this area.
+            var lastTime = e.start;
+            e.subSlices.forEach(function(slice) {
+              this.addCPUUsageOverInterval_(cpuUsage, cpuSelfTimeRatio,
+                  lastTime, slice.start);
+              lastTime = slice.end;
+            }, this);
+            this.addCPUUsageOverInterval_(cpuUsage, cpuSelfTimeRatio, lastTime,
+                e.end);
+          }
+        }, this);
+      }
+      return cpuUsage || [];
+    },
+
+    addCPUUsageOverInterval_: function(cpuUsageArray, cpuUsage, start, end) {
+      if (start >= end)
+        return;
+
+      // Simple arithmetic to find the indexes that overlap the current
+      // slice.
+      var interval = this.interval_;
+      var startIndex = Math.floor(start / interval);
+      // If the slice stops on an interval, endIndex will be too high.
+      // E.g.: start = 5, end = 10, endIndex = floor( 10 / 5 ) = 2.
+      // However, the slice is active for only one interval : [5, 10[ .
+      var endIndex = Math.ceil(end / interval) - 1;
+      var cpuUsagePerTime = cpuUsage / interval;
+
+      // Add [startIndex * interval, endIndex * interval] duration.
+      for (var i = startIndex; i < endIndex; i++)
+        cpuUsageArray[i] += cpuUsage;
+
+      // Subtract [startIndex * interval, start] duration.
+      cpuUsageArray[startIndex] -= cpuUsagePerTime *
+          (start - startIndex * interval);
+
+      // Add [endIndex * interval, end] duration.
+      cpuUsageArray[endIndex] += cpuUsagePerTime * (end - endIndex * interval);
+    },
+
+    get hasVisibleContent() {
+      return !!this.instantEILSeries && this.instantEILSeries.length > 0;
+    },
+
+    addContainersToTrackMap: function(containerToTrackMap) {
+      containerToTrackMap.addContainer(this.series_, this);
+    },
+
+    buildChartSeries_: function() {
+      if (!this.hasVisibleContent)
+        return [];
+
+      var axis = new tr.ui.tracks.ChartAxis(0, undefined);
+      var pts = new Array(this.instantEILSeries.length);
+
+      // Add all points and an extra one at the end, otherwise the last
+      // // interval doesn't show up.
+      // for (var i = 0; i <= this.cpuUsageSeries_.length; i++) {
+      //   pts[i] = new tr.ui.tracks.ChartPoint(undefined, this.interval_ * i,
+      //       this.cpuUsageSeries_[i] || 0);
+      // }
+      // interval doesn't show up.
+      // var interval = .1
+      // var intervalCount = Math.ceil(window.model_lol.bounds.max / interval);
+      for (var i = 0; i < this.instantEILSeries.length; i++) {
+        pts[i] = new tr.ui.tracks.ChartPoint(undefined, this.instantEILSeries[i][0],
+            this.instantEILSeries[i][1]);
+        // console.log([this.instantEILSeries[i][0], this.instantEILSeries[i][1]]);
+      }
+
+      // console.log(pts);
+
+      // note to self: I figure I need to hack the chart series module to make the lines interpolate properly.
+      // see this file.
+      // have fun :)
+
+
+
+      var renderingConfig = {
+        chartType: tr.ui.tracks.ChartSeriesType.PATH,
+        colorId: 0
+      };
+
+      return [new tr.ui.tracks.ChartSeries(pts, axis, renderingConfig)];
+    }
+  };
+
+  return {
+    InstantEILTrack: InstantEILTrack
+
+  };
+});
+</script>
