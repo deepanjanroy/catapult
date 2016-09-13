@@ -23,7 +23,8 @@ tr.exportTo('tr.ui.tracks', function() {
    */
   var ChartSeriesType = {
     LINE: 0,
-    AREA: 1
+    AREA: 1,
+    PATH: 2
   };
 
   // The default rendering configuration for ChartSeries.
@@ -129,12 +130,17 @@ tr.exportTo('tr.ui.tracks', function() {
             highDetails);
       }
 
+      // Draw a path
+      if (this.chartType_ === ChartSeriesType.PATH) {
+        this.drawComponent_(ctx, transform, ChartSeriesComponent.LINE, undefined, true);
+      }
+
       // Draw the points.
       this.drawComponent_(ctx, transform, ChartSeriesComponent.DOTS,
           highDetails);
     },
 
-    drawComponent_: function(ctx, transform, component, highDetails) {
+    drawComponent_: function(ctx, transform, component, highDetails, interpolatedLine) {
       // We need to consider extra pixels outside the visible area to avoid
       // visual glitches due to non-zero width of dots.
       var extraPixels = 0;
@@ -219,6 +225,7 @@ tr.exportTo('tr.ui.tracks', function() {
           break;
 
         case ChartSeriesComponent.LINE:
+        case ChartSeriesComponent.PATH:
           // Line component color and width.
           ctx.strokeStyle = EventPresenter.getCounterSeriesColor(
               this.colorId_, SelectionState.NONE);
@@ -337,7 +344,8 @@ tr.exportTo('tr.ui.tracks', function() {
               ctx.beginPath();
               ctx.moveTo(currentViewX, currentViewY);
             } else {
-              ctx.lineTo(currentViewX, previousViewY);
+              if (interpolatedLine) ctx.lineTo(currentViewX, currentViewY);
+              else ctx.lineTo(currentViewX, previousViewY);
             }
 
             // Move to the current point coordinate.
