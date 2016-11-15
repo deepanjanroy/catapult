@@ -383,19 +383,6 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function createExperimentalFirstInteractiveHistograms() {
-    // var firstInteractiveFMP = createHistogram(
-    //     'firstInteractive-FMP');
-    // var firstInteractiveFCP = createHistogram(
-    //   'firstInteractive-FCP');
-    // var firstInteractiveStartNav = createHistogram(
-    //   'firstInteractive-StartNav');
-    // var firstInteractiveFMPReverseSearch = createHistogram(
-    //   'firstInteractive-FMP-ReverseSearch');
-    // var firstInteractiveFCPReverseSearch = createHistogram(
-    //   'firstInteractive-FCP-ReverseSearch');
-    // var firstInteractiveStartNavReverseSearch = createHistogram(
-    //   'firstInteractive-StartNav-ReverseSearch');
-
     return {
       firstInteractiveFMP : createHistogram(
         'firstInteractive-FMP'),
@@ -479,9 +466,6 @@ tr.exportTo('tr.metrics.sh', function() {
       // Get the firstInteractive candidates that lie within the current window.
       var firstCandidatesInWindow = firstCandidates.filter(candidate =>
           taskWindowStart <= candidate && candidate < taskWindowEnd);
-      console.log("traceEnd", traceEnd);
-      console.log("firstCandidates", firstCandidates);
-      console.log("firstCandidatesInWindow", firstCandidatesInWindow);
 
       // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) is our
       // window. If we find more than one, this is probably a bug and it's best to bail.
