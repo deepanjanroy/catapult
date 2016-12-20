@@ -144,6 +144,7 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function findFirstMeaningfulPaintCandidates(rendererHelper) {
+
     var candidatesForFrameId = {};
     for (var ev of rendererHelper.process.getDescendantEvents()) {
       if (!hasCategoryAndName(ev, 'loading', 'firstMeaningfulPaintCandidate'))
@@ -199,7 +200,8 @@ tr.exportTo('tr.metrics.sh', function() {
       var timeToEvent = ev.start - navigationStartEvent.start;
       samples.push({
           value: timeToEvent,
-          diagnostics: {url: new tr.v.d.Generic(url)}
+          diagnostics: {url: new tr.v.d.Generic(url), eventTimestamp: new tr.v.d.Generic(ev.start),
+                        frame: new tr.v.d.Generic(frameIdRef)}
       });
     }
     return samples;
@@ -209,6 +211,7 @@ tr.exportTo('tr.metrics.sh', function() {
       frameIdRef, navigationStart, fmpMarkerEvent) {
     var snapshot = findFrameLoaderSnapshotAt(
         rendererHelper, frameIdRef, fmpMarkerEvent.start);
+
     if (snapshot === undefined || !snapshot.args.isLoadingMainFrame)
       return;
     var url = snapshot.args.documentLoaderURL;
@@ -227,7 +230,8 @@ tr.exportTo('tr.metrics.sh', function() {
             'End': new RelatedEventSet(fmpMarkerEvent),
             'Navigation infos': new tr.v.d.Generic(
                 {url: url, pid: rendererHelper.pid,
-                 start: navigationStart.start, fmp: fmpMarkerEvent.start}),
+                 start: navigationStart.start, fmp: fmpMarkerEvent.start,
+                 frame: frameIdRef}),
         }
     });
     return {firstMeaningfulPaint: fmpMarkerEvent.start, url: url};
@@ -307,6 +311,7 @@ tr.exportTo('tr.metrics.sh', function() {
       rendererHelper, navigationStartFinder) {
     var firstMeaningfulPaintSamples = [];
     var firstInteractiveSamples = [];
+    var experimentalFirstInteractiveData = {};
 
     function addSamples(frameIdRef, navigationStart, fmpMarkerEvent) {
       var data = addFirstMeaningfulPaintSample(
@@ -353,7 +358,8 @@ tr.exportTo('tr.metrics.sh', function() {
       }
     }
     return {firstMeaningfulPaintSamples: firstMeaningfulPaintSamples,
-            firstInteractiveSamples: firstInteractiveSamples};
+            firstInteractiveSamples: firstInteractiveSamples,
+            experimentalFirstInteractiveData: experimentalFirstInteractiveData};
   }
 
   function collectLoadingMetricsForRenderer(rendererHelper) {
@@ -379,6 +385,434 @@ tr.exportTo('tr.metrics.sh', function() {
       histogram.addSample(sample.value, sample.diagnostics);
   }
 
+  function createExperimentalFirstInteractiveHistograms() {
+    return {
+      firstInteractiveFMP : createHistogram(
+        'firstInteractive-FMP'),
+      firstInteractiveFCP : createHistogram(
+        'firstInteractive-FCP'),
+      firstInteractiveStartNav : createHistogram(
+        'firstInteractive-StartNav'),
+      firstInteractiveFMPReverseSearch : createHistogram(
+        'firstInteractive-FMP-ReverseSearch'),
+      firstInteractiveFCPReverseSearch : createHistogram(
+        'firstInteractive-FCP-ReverseSearch'),
+      firstInteractiveStartNavReverseSearch: createHistogram(
+        'firstInteractive-StartNav-ReverseSearch'),
+      firstInteractiveFMPNetwork: createHistogram(
+        'firstInteractive-FMP-Network'),
+      firstInteractiveFMPReverseSearchFromNetworkFirstInteractive: createHistogram(
+        'firstInteractive-FMP-ReverseSearchFromNetworkFirstInteractive')
+    };
+
+  }
+
+  function addRawSamplesToHistogram(rawSamples, histogram) {
+    for (var sample of rawSamples) {
+      histogram.addSample(sample);
+    }
+  }
+
+  function hasTitleAndCategory(event, title, category) {
+    return event.title === title && event.category &&
+      tr.b.getCategoryParts(event.category).indexOf(category) !== -1;
+  }
+
+  function getNavStartEvents(rendererHelper) {
+    var navStartEvents = [];
+    for (var e of rendererHelper.mainThread.sliceGroup.childEvents()) {
+      if (hasTitleAndCategory(e, 'navigationStart', 'blink.user_timing')) {
+        navStartEvents.push(e);
+      }
+    }
+    return navStartEvents;
+  }
+
+  // This actually ends up sorted the original array despite trying to pretend
+  // otherwise. Do not use if you want to preserve the order of the orginal array.
+  function numSorted(numericArray) {
+    return numericArray.sort((a, b) => a - b);
+  }
+
+  function findFirstIneractiveInRange(firstCandidate, windowEnd, longTasks) {
+    var longTasksInWindow = longTasks.filter(task =>
+        firstCandidate <= task.end && task.start <= windowEnd);
+
+    var quietWindowStart = firstCandidate;
+    for (var task of longTasksInWindow) {
+      if ((task.start - quietWindowStart) > INTERACTIVE_WINDOW_SIZE_MS) {
+        return quietWindowStart;
+      }
+      quietWindowStart = task.end;
+    }
+
+    if ((windowEnd - quietWindowStart) > INTERACTIVE_WINDOW_SIZE_MS) {
+      return quietWindowStart;
+    }
+
+    return null;
+  }
+
+  /**
+   * Returns the first time a page becomes interactive. For the current
+   * experiment, only one value is returned even if there are multiple
+   * navigations.
+   */
+  function calculateFirstInteractiveForwardSearch(
+      navStartTimestamps, firstCandidates, longTasks, traceEnd) {
+    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+
+    for (var i = 0; i < navStartTimestamps.length; i++) {
+      // Get our window of interest. A window begins at a navigationStart, and
+      // ends either at the next navigationStart, and when we reach end of
+      // tracing.
+      var taskWindowStart = navStartTimestamps[i];
+      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
+          navStartTimestamps[i + 1] : traceEnd;
+
+      // Get the firstInteractive candidates that lie within the current
+      // window.
+      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
+          taskWindowStart <= candidate && candidate < taskWindowEnd);
+
+      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) is
+      // our window. If we find more than one, this is probably a bug and it's
+      // best to bail.
+      if (firstCandidatesInWindow.length > 1) return null;
+      if (firstCandidatesInWindow.length == 0) continue;
+
+      var firstInteractive = findFirstIneractiveInRange(
+          firstCandidatesInWindow[0], taskWindowEnd, longTasks);
+
+      if (firstInteractive !== null) {
+        return firstInteractive;
+      }
+    }
+
+    return null;
+  }
+
+
+  function findFirstIneractiveInRangeReverseSearch(firstCandidate, windowEnd, longTasks) {
+    var longTasksInWindow = longTasks.filter(task =>
+        firstCandidate <= task.end && task.start <= windowEnd);
+
+
+
+    var possibleFirstInteractive = longTasksInWindow.length > 0 ?
+        longTasksInWindow[longTasksInWindow.length - 1].end : firstCandidate;
+
+    if ((windowEnd - possibleFirstInteractive) >= INTERACTIVE_WINDOW_SIZE_MS) {
+      return possibleFirstInteractive;
+    }
+
+    return null;
+  }
+
+  function calculateFirstInteractiveReverseSearch(
+      navStartTimestamps, firstCandidates, longTasks, traceEnd) {
+    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+
+    for (var i = 0; i < navStartTimestamps.length; i++) {
+      // Get our window of interest. A window begings at a navigationStart, and
+      // ends either at the next navigationStart, and when we reach end of
+      // tracing.
+      var taskWindowStart = navStartTimestamps[i];
+      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
+          navStartTimestamps[i + 1] : traceEnd;
+
+      // Get the firstInteractive candidates that lie within the current window.
+      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
+          taskWindowStart <= candidate && candidate < taskWindowEnd);
+
+      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
+      // window. If we find more than one, this is probably a bug and it's best to bail.
+      if (firstCandidatesInWindow.length > 1) return null;
+      if (firstCandidatesInWindow.length == 0) continue;
+
+      var firstInteractive = findFirstIneractiveInRangeReverseSearch(
+          firstCandidatesInWindow[0], taskWindowEnd, longTasks);
+
+      if (firstInteractive !== null) return firstInteractive;
+    }
+
+    return null;
+  }
+
+  function getNetworkRequests(rendererHelper) {
+    return rendererHelper.mainThread.asyncSliceGroup.slices.filter(slice =>
+        slice.title === 'ResourceLoad');
+  }
+
+  function getActiveNetworkRequests(timestamp, networkRequests) {
+    // Brute force algortihm for finding number of active network requests at a
+    // given timestamp. Eventually we should optimize this, perhaps using an
+    // interval tree.
+    var activeRequests = [];
+    for (var req of networkRequests) {
+      // If a req begins at timestamp, count it as an active request.
+      // If a req ends at timestamp, do not count it as an active request.
+      if (req.start <= timestamp && timestamp < req.end) activeRequests.push(req);
+    }
+    return activeRequests;
+  }
+
+  function findFirstIneractiveInRangeForwardSearchNetwork(
+      firstCandidate, windowEnd, longTasks, networkRequests) {
+    var activeNetworkRequestTolerance = 2;
+
+    var longTasksInWindow = longTasks.filter(task =>
+        firstCandidate <= task.end && task.start <= windowEnd);
+
+    var networkRequestsInWindow = networkRequests.filter(req =>
+        firstCandidate <= req.end && req.start <= windowEnd);
+
+
+    var interestingTimeStamps = [];
+
+    for (var task of longTasksInWindow) {
+      interestingTimeStamps.push({
+        time: task.start,
+        type: "taskStart",
+        slice: task
+      });
+      interestingTimeStamps.push({
+        time: task.end,
+        type: "taskEnd",
+        slice: task
+      });
+    };
+
+    for (var req of networkRequestsInWindow) {
+      interestingTimeStamps.push({
+        time: req.start,
+        type: "requestStart",
+        slice: req
+      });
+      interestingTimeStamps.push({
+        time: req.end,
+        type: "requestEnd",
+        slice: req
+      });
+    }
+
+    interestingTimeStamps.sort((a, b) => a.time - b.time);
+
+    var quietWindowStart = firstCandidate;
+    var activeNetworkRequests = 0;
+
+    for (var timestamp of interestingTimeStamps) {
+      switch(timestamp.type) {
+        case "taskStart":
+          if (timestamp.time - quietWindowStart >= INTERACTIVE_WINDOW_SIZE_MS &&
+              activeNetworkRequests <= activeNetworkRequestTolerance) {
+            return quietWindowStart;
+          }
+          quietWindowStart = Math.max(quietWindowStart, timestamp.slice.end);
+          break;
+        case "taskEnd":
+          // Nothing to do.
+          break;
+        case "requestStart":
+          activeNetworkRequests++;
+          break;
+        case "requestEnd":
+          // First check if we just exited a period of network business.
+          if (activeNetworkRequests > activeNetworkRequestTolerance) {
+            quietWindowStart = Math.max(quietWindowStart, timestamp.time);
+          }
+          activeNetworkRequests--;
+          break;
+      }
+    }
+
+    if (windowEnd - quietWindowStart >= INTERACTIVE_WINDOW_SIZE_MS &&
+        activeNetworkRequests <= activeNetworkRequestTolerance) {
+      return quietWindowStart;
+    }
+
+    return null;
+  }
+
+  function calculateFirstInteractiveForwardSearchNetwork(
+    navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd) {
+    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+
+    for (var i = 0; i < navStartTimestamps.length; i++) {
+      // Get our window of interest. A window begings at a navigationStart, and
+      // ends either at the next navigationStart, and when we reach end of
+      // tracing.
+      var taskWindowStart = navStartTimestamps[i];
+      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
+          navStartTimestamps[i + 1] : traceEnd;
+
+      // Get the firstInteractive candidates that lie within the current window.
+      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
+          taskWindowStart <= candidate && candidate < taskWindowEnd);
+
+      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
+      // window. If we find more than one, this is probably a bug and it's best to bail.
+      if (firstCandidatesInWindow.length > 1) return null;
+      if (firstCandidatesInWindow.length == 0) continue;
+
+      var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
+          firstCandidatesInWindow[0], taskWindowEnd, longTasks, networkRequests);
+
+      if (firstInteractive !== null) {
+        return firstInteractive;
+      }
+    }
+
+    return null;
+  }
+
+  function calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
+      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd) {
+    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+
+    for (var i = 0; i < navStartTimestamps.length; i++) {
+      // Get our window of interest. A window begings at a navigationStart, and
+      // ends either at the next navigationStart, and when we reach end of
+      // tracing.
+      var taskWindowStart = navStartTimestamps[i];
+      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
+          navStartTimestamps[i + 1] : traceEnd;
+
+      // Get the firstInteractive candidates that lie within the current window.
+      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
+          taskWindowStart <= candidate && candidate < taskWindowEnd);
+
+      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
+      // window. If we find more than one, this is probably a bug and it's best to bail.
+      if (firstCandidatesInWindow.length > 1) return null;
+      if (firstCandidatesInWindow.length == 0) continue;
+      var firstCandidate = firstCandidatesInWindow[0];
+
+      var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
+          firstCandidate, taskWindowEnd, longTasks, networkRequests);
+
+      if (firstInteractive !== null) {
+        // Now do a reverseSearch.
+        var smallEpsilon = 0.1  // Used to counter floating point errors.
+        var refinedFirstInteractive = findFirstIneractiveInRangeReverseSearch(
+            firstCandidate, firstInteractive + INTERACTIVE_WINDOW_SIZE_MS + smallEpsilon, longTasks);
+        if (refinedFirstInteractive === null) {
+          // In the worst case, refinedFirstInteractive should be the same as original
+          // firstInteractive.
+          throw Error("This should never happen");
+        }
+        return refinedFirstInteractive;
+      }
+    }
+
+    return null;
+  }
+
+  function findMainLoadingFrames(traceObjects) {
+    var frameLoaderInstances = traceObjects.instancesByTypeName_['FrameLoader'];
+    var mainFrames = [];
+    for (var frameLoaderInstance of frameLoaderInstances) {
+      if (frameLoaderInstance.modelItem.snapshots.length > 0 &&
+          frameLoaderInstance.modelItem.snapshots[0].isLoadingMainFrame) {
+        mainFrames.add
+      }
+    }
+    frameLoaderInstances.map(oi => oi.modelItem.snapshots.map(s => s.args.isLoadingMainFrame))
+  }
+
+  function addExperimentalFirstInteractiveSamples(histograms, loadingMetrics, rendererHelper) {
+    var navigationStartEvents = getNavStartEvents(rendererHelper).filter(event => {
+      // Only find navigationStart events for the main loading frame
+      var frameIdRef = event.args['frame'];
+      var snapshot = findFrameLoaderSnapshotAt(rendererHelper, frameIdRef, event.start);
+      return snapshot && snapshot.args.isLoadingMainFrame;
+    });
+    navigationStartEvents.sort((a, b) => a.start - b.start);
+
+
+    var navStartTimesByFrame = new Map();
+    for (var e of navigationStartEvents) {
+      var navStartTimestamps = navStartTimesByFrame.get(e.args.frame) || [];
+      navStartTimestamps.push(e.start);
+      navStartTimesByFrame.set(e.args.frame, navStartTimestamps);
+    }
+
+    var fmpTimestampsByFrame = new Map();
+    for (var sample of loadingMetrics.firstMeaningfulPaintSamples) {
+      var frame = sample.diagnostics['Navigation infos'].value.frame;
+      var time = sample.diagnostics['Navigation infos'].value.fmp;
+      var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
+      fmpTimestamps.push(time);
+      fmpTimestampsByFrame.set(frame, fmpTimestamps);
+    }
+
+    var fcpTimestampsByFrame = new Map();
+    for (var sample of loadingMetrics.firstContentfulPaintSamples) {
+      var frame = sample.diagnostics.frame.value;
+      var time = sample.diagnostics.eventTimestamp.value;
+      var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
+      fcpTimestamps.push(time);
+      fcpTimestampsByFrame.set(frame, fcpTimestamps);
+    }
+
+    var networkRequests = getNetworkRequests(rendererHelper);
+    networkRequests.sort((a, b) => a.end - b.end);
+
+    var longTasks = [];
+    for (var e of rendererHelper.mainThread.sliceGroup.childEvents()) {
+      if (e.title === 'TaskQueueManager::ProcessTaskFromWorkQueue' &&
+          e.duration > RESPONSIVENESS_THRESHOLD_MS) {
+        longTasks.push(e);
+      }
+    }
+    longTasks.sort((a, b) => a.start - b.start);
+
+    var traceEnd = rendererHelper.modelHelper.model.bounds.max;
+
+    for (var [frame, navStartTimestamps] of navStartTimesByFrame) {
+      var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
+      var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
+
+      histograms.firstInteractiveFMP.addSample(
+          calculateFirstInteractiveForwardSearch(
+            navStartTimestamps, fmpTimestamps, longTasks, traceEnd));
+
+      histograms.firstInteractiveFCP.addSample(
+          calculateFirstInteractiveForwardSearch(
+              navStartTimestamps, fcpTimestamps, longTasks, traceEnd));
+
+      histograms.firstInteractiveStartNav.addSample(
+          calculateFirstInteractiveForwardSearch(
+              navStartTimestamps, navStartTimestamps, longTasks, traceEnd));
+
+      histograms.firstInteractiveFMPReverseSearch.addSample(
+          calculateFirstInteractiveReverseSearch(
+              navStartTimestamps, fmpTimestamps, longTasks, traceEnd));
+
+      histograms.firstInteractiveFCPReverseSearch.addSample(
+          calculateFirstInteractiveReverseSearch(
+              navStartTimestamps, fcpTimestamps, longTasks, traceEnd));
+
+      histograms.firstInteractiveStartNavReverseSearch.addSample(
+          calculateFirstInteractiveReverseSearch(
+              navStartTimestamps, navStartTimestamps, longTasks, traceEnd));
+
+      histograms.firstInteractiveFMPNetwork.addSample(
+          calculateFirstInteractiveForwardSearchNetwork(
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd));
+
+      histograms.firstInteractiveFMPReverseSearchFromNetworkFirstInteractive.addSample(
+          calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd));
+    }
+  }
+
+  function addExperimentalHistogramsToValues(values, histograms) {
+    for (var name in histograms) {
+      values.addHistogram(histograms[name]);
+    }
+  }
+
   function loadingMetric(values, model) {
     var firstContentfulPaintHistogram = createHistogram(
         'timeToFirstContentfulPaint');
@@ -393,6 +827,7 @@ tr.exportTo('tr.metrics.sh', function() {
         'time to first meaningful paint';
     var firstInteractiveHistogram = createHistogram('timeToFirstInteractive');
     firstInteractiveHistogram.description = 'time to first interactive';
+    var experimentalHistograms = createExperimentalFirstInteractiveHistograms();
 
     var chromeHelper = model.getOrCreateHelper(
         tr.model.helpers.ChromeModelHelper);
@@ -401,9 +836,9 @@ tr.exportTo('tr.metrics.sh', function() {
       if (rendererHelper.isChromeTracingUI)
         continue;
 
+      var rendererLoadingMetrics = collectLoadingMetricsForRenderer(rendererHelper);
       var {firstContentfulPaintSamples, onLoadSamples,
-           firstMeaningfulPaintSamples, firstInteractiveSamples} =
-          collectLoadingMetricsForRenderer(rendererHelper);
+           firstMeaningfulPaintSamples, firstInteractiveSamples} = rendererLoadingMetrics;
 
       addSamplesToHistogram(firstContentfulPaintSamples,
                             firstContentfulPaintHistogram);
@@ -412,12 +847,16 @@ tr.exportTo('tr.metrics.sh', function() {
                             firstMeaningfulPaintHistogram);
       addSamplesToHistogram(firstInteractiveSamples,
                             firstInteractiveHistogram);
+
+      addExperimentalFirstInteractiveSamples(experimentalHistograms, rendererLoadingMetrics, rendererHelper);
     }
 
     values.addHistogram(firstContentfulPaintHistogram);
     values.addHistogram(onLoadHistogram);
     values.addHistogram(firstMeaningfulPaintHistogram);
     values.addHistogram(firstInteractiveHistogram);
+
+    addExperimentalHistogramsToValues(values, experimentalHistograms);
   }
 
   tr.metrics.MetricRegistry.register(loadingMetric);
