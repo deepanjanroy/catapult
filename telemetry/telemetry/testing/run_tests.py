@@ -141,7 +141,7 @@ class RunTestsCommand(command_line.OptparseCommand):
     # Fetch all binaries needed by telemetry before we run the benchmark.
     if possible_browser and possible_browser.browser_type == 'reference':
       fetch_reference_chrome_binary = True
-    binary_manager.FetchBinaryDepdencies(
+    binary_manager.FetchBinaryDependencies(
         platform, args.client_configs, fetch_reference_chrome_binary)
 
     # Telemetry seems to overload the system if we run one test per core,
@@ -154,8 +154,7 @@ class RunTestsCommand(command_line.OptparseCommand):
     if platform.GetOSName() == 'chromeos':
       runner.args.jobs = 1
     elif platform.GetOSName() == 'android':
-      android_devs = android_device.FindAllAvailableDevices(args)
-      runner.args.jobs = len(android_devs)
+      runner.args.jobs = 1
       if runner.args.jobs == 0:
         raise RuntimeError("No Android device found")
       print 'Running tests with %d Android device(s).' % runner.args.jobs
