@@ -471,19 +471,19 @@ tr.exportTo('tr.metrics.sh', function() {
     return numericArray.sort((a, b) => a - b);
   }
 
-  function findFirstIneractiveInRange(firstCandidate, windowEnd, longTasks) {
+  function findFirstInteractiveInRange(firstCandidate, windowEnd, longTasks, interactiveWindowSize) {
     var longTasksInWindow = longTasks.filter(task =>
         firstCandidate <= task.end && task.start <= windowEnd);
 
     var quietWindowStart = firstCandidate;
     for (var task of longTasksInWindow) {
-      if ((task.start - quietWindowStart) > INTERACTIVE_WINDOW_SIZE_MS) {
+      if ((task.start - quietWindowStart) > interactiveWindowSize) {
         return quietWindowStart;
       }
       quietWindowStart = task.end;
     }
 
-    if ((windowEnd - quietWindowStart) > INTERACTIVE_WINDOW_SIZE_MS) {
+    if ((windowEnd - quietWindowStart) > interactiveWindowSize) {
       return quietWindowStart;
     }
 
@@ -496,7 +496,7 @@ tr.exportTo('tr.metrics.sh', function() {
    * navigations.
    */
   function calculateFirstInteractiveForwardSearch(
-      navStartTimestamps, firstCandidates, longTasks, traceEnd) {
+      navStartTimestamps, firstCandidates, longTasks, traceEnd, interactiveWindowSize) {
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
 
     for (var i = 0; i < navStartTimestamps.length; i++) {
@@ -518,8 +518,8 @@ tr.exportTo('tr.metrics.sh', function() {
       if (firstCandidatesInWindow.length > 1) return null;
       if (firstCandidatesInWindow.length == 0) continue;
 
-      var firstInteractive = findFirstIneractiveInRange(
-          firstCandidatesInWindow[0], taskWindowEnd, longTasks);
+      var firstInteractive = findFirstInteractiveInRange(
+          firstCandidatesInWindow[0], taskWindowEnd, longTasks, interactiveWindowSize);
 
       if (firstInteractive !== null) {
         return firstInteractive;
@@ -530,16 +530,14 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
 
-  function findFirstIneractiveInRangeReverseSearch(firstCandidate, windowEnd, longTasks) {
+  function findFirstIneractiveInRangeReverseSearch(firstCandidate, windowEnd, longTasks, interactiveWindowSize) {
     var longTasksInWindow = longTasks.filter(task =>
         firstCandidate <= task.end && task.start <= windowEnd);
-
-
 
     var possibleFirstInteractive = longTasksInWindow.length > 0 ?
         longTasksInWindow[longTasksInWindow.length - 1].end : firstCandidate;
 
-    if ((windowEnd - possibleFirstInteractive) >= INTERACTIVE_WINDOW_SIZE_MS) {
+    if ((windowEnd - possibleFirstInteractive) >= interactiveWindowSize) {
       return possibleFirstInteractive;
     }
 
@@ -547,7 +545,7 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function calculateFirstInteractiveReverseSearch(
-      navStartTimestamps, firstCandidates, longTasks, traceEnd) {
+      navStartTimestamps, firstCandidates, longTasks, traceEnd, interactiveWindowSize) {
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
 
     for (var i = 0; i < navStartTimestamps.length; i++) {
@@ -568,7 +566,7 @@ tr.exportTo('tr.metrics.sh', function() {
       if (firstCandidatesInWindow.length == 0) continue;
 
       var firstInteractive = findFirstIneractiveInRangeReverseSearch(
-          firstCandidatesInWindow[0], taskWindowEnd, longTasks);
+          firstCandidatesInWindow[0], taskWindowEnd, longTasks, interactiveWindowSize);
 
       if (firstInteractive !== null) return firstInteractive;
     }
@@ -595,7 +593,7 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function findFirstIneractiveInRangeForwardSearchNetwork(
-      firstCandidate, windowEnd, longTasks, networkRequests) {
+      firstCandidate, windowEnd, longTasks, networkRequests, interactiveWindowSize) {
     var activeNetworkRequestTolerance = 2;
 
     var longTasksInWindow = longTasks.filter(task =>
@@ -641,7 +639,7 @@ tr.exportTo('tr.metrics.sh', function() {
     for (var timestamp of interestingTimeStamps) {
       switch(timestamp.type) {
         case "taskStart":
-          if (timestamp.time - quietWindowStart >= INTERACTIVE_WINDOW_SIZE_MS &&
+          if (timestamp.time - quietWindowStart >= interactiveWindowSize &&
               activeNetworkRequests <= activeNetworkRequestTolerance) {
             return quietWindowStart;
           }
@@ -663,7 +661,7 @@ tr.exportTo('tr.metrics.sh', function() {
       }
     }
 
-    if (windowEnd - quietWindowStart >= INTERACTIVE_WINDOW_SIZE_MS &&
+    if (windowEnd - quietWindowStart >= interactiveWindowSize &&
         activeNetworkRequests <= activeNetworkRequestTolerance) {
       return quietWindowStart;
     }
@@ -672,7 +670,7 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function calculateFirstInteractiveForwardSearchNetwork(
-    navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd) {
+    navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize) {
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
 
     for (var i = 0; i < navStartTimestamps.length; i++) {
@@ -693,7 +691,7 @@ tr.exportTo('tr.metrics.sh', function() {
       if (firstCandidatesInWindow.length == 0) continue;
 
       var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
-          firstCandidatesInWindow[0], taskWindowEnd, longTasks, networkRequests);
+          firstCandidatesInWindow[0], taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
 
       if (firstInteractive !== null) {
         return firstInteractive;
@@ -703,8 +701,10 @@ tr.exportTo('tr.metrics.sh', function() {
     return null;
   }
 
+
+  // This is NetworkReverseSearch
   function calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
-      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd) {
+      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize) {
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
 
     for (var i = 0; i < navStartTimestamps.length; i++) {
@@ -726,13 +726,13 @@ tr.exportTo('tr.metrics.sh', function() {
       var firstCandidate = firstCandidatesInWindow[0];
 
       var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
-          firstCandidate, taskWindowEnd, longTasks, networkRequests);
+          firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
 
       if (firstInteractive !== null) {
         // Now do a reverseSearch.
         var smallEpsilon = 0.1  // Used to counter floating point errors.
         var refinedFirstInteractive = findFirstIneractiveInRangeReverseSearch(
-            firstCandidate, firstInteractive + INTERACTIVE_WINDOW_SIZE_MS + smallEpsilon, longTasks);
+            firstCandidate, firstInteractive + interactiveWindowSize + smallEpsilon, longTasks, interactiveWindowSize);
         if (refinedFirstInteractive === null) {
           // In the worst case, refinedFirstInteractive should be the same as original
           // firstInteractive.
@@ -812,35 +812,36 @@ tr.exportTo('tr.metrics.sh', function() {
 
       histograms.firstInteractiveFMP.addSample(
           calculateFirstInteractiveForwardSearch(
-            navStartTimestamps, fmpTimestamps, longTasks, traceEnd));
+            navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveFCP.addSample(
           calculateFirstInteractiveForwardSearch(
-              navStartTimestamps, fcpTimestamps, longTasks, traceEnd));
+              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveStartNav.addSample(
           calculateFirstInteractiveForwardSearch(
-              navStartTimestamps, navStartTimestamps, longTasks, traceEnd));
+              navStartTimestamps, navStartTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveFMPReverseSearch.addSample(
           calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, fmpTimestamps, longTasks, traceEnd));
+              navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveFCPReverseSearch.addSample(
           calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, fcpTimestamps, longTasks, traceEnd));
+              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveStartNavReverseSearch.addSample(
           calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, navStartTimestamps, longTasks, traceEnd));
+              navStartTimestamps, navStartTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveFMPNetwork.addSample(
           calculateFirstInteractiveForwardSearchNetwork(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd));
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveFMPReverseSearchFromNetworkFirstInteractive.addSample(
           calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd));
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+
     }
   }
 
