@@ -439,7 +439,9 @@ tr.exportTo('tr.metrics.sh', function() {
       firstInteractiveFMPNetwork: createHistogram(
         'firstInteractive-FMP-Network'),
       firstInteractiveFMPReverseSearchFromNetworkFirstInteractive: createHistogram(
-        'firstInteractive-FMP-ReverseSearchFromNetworkFirstInteractive')
+        'firstInteractive-FMP-ReverseSearchFromNetworkFirstInteractive'),
+      firstInteractiveNetRevEQT: createHistogram(
+        'firstInteractiveNetRevEQT')
     };
 
   }
@@ -702,7 +704,7 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
 
-  // This is NetworkReverseSearch
+  // This is networkReverseSearch
   function calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
       navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize) {
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
@@ -744,6 +746,205 @@ tr.exportTo('tr.metrics.sh', function() {
 
     return null;
   }
+
+  function getInteractivePeriodBeginnings(
+    firstCandidate, taskWindowEnd, longTasks, interactiveWindowSize) {
+    var longTasksInWindow = longTasks.filter(task =>
+        firstCandidate <= task.end && task.start <= taskWindowEnd);
+
+    var interactivePeriodBeginnings = [];
+
+    var quietWindowStart = firstCandidate;
+    for (var task of longTasksInWindow) {
+      if ((task.start - quietWindowStart) > interactiveWindowSize) {
+        interactivePeriodBeginnings.push(quietWindowStart);
+      }
+      quietWindowStart = task.end;
+    }
+
+    if ((taskWindowEnd - quietWindowStart) > interactiveWindowSize) {
+      interactivePeriodBeginnings.push(quietWindowStart);
+    }
+
+    return interactivePeriodBeginnings;
+  }
+
+  // Duplicated code from network reverse search to use in the eqt based optimistic tti.
+  function findNetworkReverseSearchFirstInteractive(
+      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize) {
+    var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
+      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
+
+    if (firstInteractive !== null) {
+      // Now do a reverseSearch.
+      var smallEpsilon = 0.1  // Used to counter floating point errors.
+      var refinedFirstInteractive = findFirstIneractiveInRangeReverseSearch(
+        firstCandidate, firstInteractive + interactiveWindowSize + smallEpsilon, longTasks, interactiveWindowSize);
+      if (refinedFirstInteractive === null) {
+        // In the worst case, refinedFirstInteractive should be the same as original
+        // firstInteractive.
+        throw Error("This should never happen");
+      }
+      return refinedFirstInteractive;
+    }
+
+    return null;
+  }
+
+  function getEQT(mainThreadTasks, windowStart, windowEnd) {
+    var tasksInWindow = mainThreadTasks.filter(t => t.start >= windowStart && t.end <= windowEnd);
+    var windowSize = windowEnd - windowStart;
+    var eqt = 0;
+    for (var t of tasksInWindow) {
+      // eqt += probability of landing on task * mean eqt if landed on task
+      eqt += (t.duration / windowSize) * (t.duration / 2);
+    }
+    return eqt;
+  }
+
+  // This is the one where we look at the EQT between two potential
+  // firstInteractive candidates and if the EQT is low enough we take the
+  // earlier one.
+  function calculateFirstInteractiveNetRevEQT(
+      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize,
+      mainThreadTasks) {
+
+    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+
+    for (var i = 0; i < navStartTimestamps.length; i++) {
+      // Get our window of interest. A window begings at a navigationStart, and
+      // ends either at the next navigationStart, and when we reach end of
+      // tracing.
+      var taskWindowStart = navStartTimestamps[i];
+      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
+          navStartTimestamps[i + 1] : traceEnd;
+
+      // Get the firstInteractive candidates that lie within the current window.
+      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
+          taskWindowStart <= candidate && candidate < taskWindowEnd);
+
+      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
+      // window. If we find more than one, this is probably a bug and it's best to bail.
+      if (firstCandidatesInWindow.length > 1) return null;
+      if (firstCandidatesInWindow.length == 0) continue;
+      var firstCandidate = firstCandidatesInWindow[0];
+
+      // Get all forward search firstInteractives with 1s window in given range.
+      // This is the left boundary of our quest for firstInteractive
+      var interactivePeriodBeginnings = getInteractivePeriodBeginnings(
+        firstCandidate, taskWindowEnd, longTasks, 1000);
+
+      // Get the network reverse search firstInteractive.
+      // This is the right boundary of our quest for firstInteractive
+      var networkReverseFirstInteractive = findNetworkReverseSearchFirstInteractive(
+        firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
+
+      // We don't really care about interactiveBeginnings beyond networkReverseFirstInteractive
+      // Fingers crossed we don't get bit by floating point errors.
+      // I don't want to preemptively add an epsilon here, but pls do if bugs show up
+      interactivePeriodBeginnings = interactivePeriodBeginnings.filter(
+          t => t <= networkReverseFirstInteractive);
+
+      if (interactivePeriodBeginnings.length === 0) return null;
+      if (networkReverseFirstInteractive === null) return null;
+      // console.log(interactivePeriodBeginnings);
+      // console.log(networkReverseFirstInteractive);
+      if (interactivePeriodBeginnings[interactivePeriodBeginnings.length - 1] !== networkReverseFirstInteractive) {
+        throw new Error("This should not happen");
+      }
+
+      // TODO: Now starting from the end, see if EQT between two interactive points is lower than 25ms.
+      var j = interactivePeriodBeginnings.length - 1;
+      for (var j = interactivePeriodBeginnings.length - 1; j >= 1; j--) {
+        // This gets the EQT (as in mean Queuing Time - not a percentile)
+        // between the two interactive beginnings.
+        // Since we know window start and ends are both ends of long tasks,
+        // we do not have to deal with window clippings
+        var eqt = getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1], interactivePeriodBeginnings[j]);
+        // console.log(`EQT between ${interactivePeriodBeginnings[j]} and ${interactivePeriodBeginnings[j - 1]}: ${eqt}`);
+        if (getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1],
+            interactivePeriodBeginnings[j]) > 25) {
+          return interactivePeriodBeginnings[j];
+        }
+      }
+    }
+
+    return interactivePeriodBeginnings[0];
+  }
+
+  // This is the one where we search backwards from network TTI, but instead of
+  // strictly looking for long tasks, we look for windows with high EQT.
+  // function calculateFirstInteractiveNetRevHighEQTWindow(
+  //     navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize,
+  //     mainThreadTasks, eqtWindowSize, eqtThreshold) {
+
+  //   if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+
+  //   for (var i = 0; i < navStartTimestamps.length; i++) {
+  //     // Get our window of interest. A window begings at a navigationStart, and
+  //     // ends either at the next navigationStart, and when we reach end of
+  //     // tracing.
+  //     var taskWindowStart = navStartTimestamps[i];
+  //     var taskWindowEnd = i + 1 < navStartTimestamps.length ?
+  //         navStartTimestamps[i + 1] : traceEnd;
+
+  //     // Get the firstInteractive candidates that lie within the current window.
+  //     var firstCandidatesInWindow = firstCandidates.filter(candidate =>
+  //         taskWindowStart <= candidate && candidate < taskWindowEnd);
+
+  //     // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
+  //     // window. If we find more than one, this is probably a bug and it's best to bail.
+  //     if (firstCandidatesInWindow.length > 1) return null;
+  //     if (firstCandidatesInWindow.length == 0) continue;
+  //     var firstCandidate = firstCandidatesInWindow[0];
+
+  //     // Get all forward search firstInteractives with 1s window in given range.
+  //     // This is the left boundary of our quest for firstInteractive
+  //     var interactivePeriodBeginnings = getInteractivePeriodBeginnings(
+  //       firstCandidate, taskWindowEnd, longTasks, 1000);
+
+  //     // Get the network reverse search firstInteractive.
+  //     // This is the right boundary of our quest for firstInteractive
+  //     var networkReverseFirstInteractive = findNetworkReverseSearchFirstInteractive(
+  //       firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
+
+  //     // Now look backward for a window of eqtWindowSize ms such that with mean
+  //     // EQT less than eqtThreshold
+      
+
+  //     // We don't really care about interactiveBeginnings beyond networkReverseFirstInteractive
+  //     // Fingers crossed we don't get bit by floating point errors.
+  //     // I don't want to preemptively add an epsilon here, but pls do if bugs show up
+  //     interactivePeriodBeginnings = interactivePeriodBeginnings.filter(
+  //         t => t <= networkReverseFirstInteractive);
+
+  //     if (interactivePeriodBeginnings.length === 0) return null;
+  //     if (networkReverseFirstInteractive === null) return null;
+  //     // console.log(interactivePeriodBeginnings);
+  //     // console.log(networkReverseFirstInteractive);
+  //     if (interactivePeriodBeginnings[interactivePeriodBeginnings.length - 1] !== networkReverseFirstInteractive) {
+  //       throw new Error("This should not happen");
+  //     }
+
+  //     // TODO: Now starting from the end, see if EQT between two interactive points is lower than 25ms.
+  //     var j = interactivePeriodBeginnings.length - 1;
+  //     for (var j = interactivePeriodBeginnings.length - 1; j >= 1; j--) {
+  //       // This gets the EQT (as in mean Queuing Time - not a percentile)
+  //       // between the two interactive beginnings.
+  //       // Since we know window start and ends are both ends of long tasks,
+  //       // we do not have to deal with window clippings
+  //       var eqt = getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1], interactivePeriodBeginnings[j]);
+  //       // console.log(`EQT between ${interactivePeriodBeginnings[j]} and ${interactivePeriodBeginnings[j - 1]}: ${eqt}`);
+  //       if (getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1],
+  //           interactivePeriodBeginnings[j]) > 25) {
+  //         return interactivePeriodBeginnings[j];
+  //       }
+  //     }
+  //   }
+
+  //   return interactivePeriodBeginnings[0];
+  // }
+
 
   function findMainLoadingFrames(traceObjects) {
     var frameLoaderInstances = traceObjects.instancesByTypeName_['FrameLoader'];
@@ -795,14 +996,15 @@ tr.exportTo('tr.metrics.sh', function() {
     var networkRequests = getNetworkRequests(rendererHelper);
     networkRequests.sort((a, b) => a.end - b.end);
 
+    var mainThreadTasks = [];
     var longTasks = [];
     for (var e of rendererHelper.mainThread.sliceGroup.childEvents()) {
-      if (e.title === 'TaskQueueManager::ProcessTaskFromWorkQueue' &&
-          e.duration > RESPONSIVENESS_THRESHOLD_MS) {
-        longTasks.push(e);
+      if (e.title === 'TaskQueueManager::ProcessTaskFromWorkQueue') {
+        mainThreadTasks.push(e);
       }
     }
-    longTasks.sort((a, b) => a.start - b.start);
+    mainThreadTasks.sort((a, b) => a.start - b.start);
+    longTasks = mainThreadTasks.filter(t => t.duration > RESPONSIVENESS_THRESHOLD_MS);
 
     var traceEnd = rendererHelper.modelHelper.model.bounds.max;
 
@@ -812,6 +1014,7 @@ tr.exportTo('tr.metrics.sh', function() {
 
       histograms.firstInteractiveFMP.addSample(
           calculateFirstInteractiveForwardSearch(
+            // Running experiment here
             navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
       histograms.firstInteractiveFCP.addSample(
@@ -842,6 +1045,10 @@ tr.exportTo('tr.metrics.sh', function() {
           calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
               navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
 
+      histograms.firstInteractiveNetRevEQT.addSample(
+          calculateFirstInteractiveNetRevEQT(
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
+              INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks));
     }
   }
 
