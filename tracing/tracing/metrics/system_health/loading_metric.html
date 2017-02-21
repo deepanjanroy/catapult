@@ -707,9 +707,16 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
 
+  function getFCPInWindow(windowStart, windowEnd, fcpTimestamps) {
+    var fcpsInWindow = fcpTimestamps.filter(t => windowStart <= t && t < windowEnd);
+    if (fcpsInWindow.length > 1 || fcpsInWindow.length == 0) return null;
+    return fcpsInWindow[0];
+  }
+
+
   // This is networkReverseSearch
   function calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
-      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize) {
+      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize, fcpTimestamps) {
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
 
     for (var i = 0; i < navStartTimestamps.length; i++) {
@@ -743,7 +750,14 @@ tr.exportTo('tr.metrics.sh', function() {
           // firstInteractive.
           throw Error("This should never happen");
         }
-        return refinedFirstInteractive;
+        return {
+          value: refinedFirstInteractive,
+          diagnostics: {
+            tti: new tr.v.d.Generic(refinedFirstInteractive - taskWindowStart),
+            searchBegin: new tr.v.d.Generic(firstCandidate),
+            fcp: new tr.v.d.Generic(getFCPInWindow(taskWindowStart, taskWindowEnd, fcpTimestamps))
+          }
+        };
       }
     }
 
@@ -1031,48 +1045,50 @@ tr.exportTo('tr.metrics.sh', function() {
       var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
       var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
 
-      histograms.firstInteractiveFMP.addSample(
-          calculateFirstInteractiveForwardSearch(
-            // Running experiment here
-            navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveForwardSearch(
+            navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
+           histograms.firstInteractiveFMP);
 
-      histograms.firstInteractiveFCP.addSample(
-          calculateFirstInteractiveForwardSearch(
-              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveForwardSearch(
+              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
+           histograms.firstInteractiveFCP);
 
-      histograms.firstInteractiveStartNav.addSample(
-          calculateFirstInteractiveForwardSearch(
-              navStartTimestamps, navStartTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveReverseSearch(
+              navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
+          histograms.firstInteractiveFMPReverseSearch);
 
-      histograms.firstInteractiveFMPReverseSearch.addSample(
-          calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveReverseSearch(
+              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
+          histograms.firstInteractiveFCPReverseSearch);
 
-      histograms.firstInteractiveFCPReverseSearch.addSample(
-          calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveReverseSearch(
+              navStartTimestamps, navStartTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
+          histograms.firstInteractiveStartNavReverseSearch);
 
-      histograms.firstInteractiveStartNavReverseSearch.addSample(
-          calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, navStartTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveForwardSearchNetwork(
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
+          histograms.firstInteractiveFMPNetwork);
 
-      histograms.firstInteractiveFMPNetwork.addSample(
-          calculateFirstInteractiveForwardSearchNetwork(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS, fcpTimestamps)],
+          histograms.firstInteractiveFMPReverseSearchFromNetworkFirstInteractive);
 
-      histograms.firstInteractiveFMPReverseSearchFromNetworkFirstInteractive.addSample(
-          calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS));
+      // histograms.firstInteractiveNetRevEQT.addSample(
+      //     calculateFirstInteractiveNetRevEQT(
+      //         navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
+      //         INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks));
 
-      histograms.firstInteractiveNetRevEQT.addSample(
-          calculateFirstInteractiveNetRevEQT(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
-              INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks));
-
-      histograms.firstInteractiveNetRevHighEQTWindow.addSample(
-        calculateFirstInteractiveNetRevHighEQTWindow(
-          navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
-          INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks, 500, 25));
+      // histograms.firstInteractiveNetRevHighEQTWindow.addSample(
+      //   calculateFirstInteractiveNetRevHighEQTWindow(
+      //     navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
+      //     INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks, 500, 25));
     }
   }
 
