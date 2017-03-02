@@ -284,6 +284,10 @@ tr.exportTo('tr.e.chrome', function() {
       }
     }
 
+    get range() {
+        return this.range_;
+    }
+
     taskIndexInBounds(index) {
       return index >= 0 && index < this.sortedTasks_.length;
     }

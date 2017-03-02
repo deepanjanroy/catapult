@@ -419,7 +419,14 @@ tr.exportTo('tr.metrics.sh', function() {
 
   function addSamplesToHistogram(samples, histogram) {
     for (var sample of samples) {
-      histogram.addSample(sample.value, sample.diagnostics);
+      if (sample !== null) {
+        if (typeof(sample) === "number") {
+          histogram.addSample(sample);
+        } else {
+          // Assume sample is of the form {value, diagnostics}
+          histogram.addSample(sample.value, sample.diagnostics);
+        }
+      }
     }
   }
 
@@ -727,6 +734,7 @@ tr.exportTo('tr.metrics.sh', function() {
       var taskWindowEnd = i + 1 < navStartTimestamps.length ?
           navStartTimestamps[i + 1] : traceEnd;
 
+
       // Get the firstInteractive candidates that lie within the current window.
       var firstCandidatesInWindow = firstCandidates.filter(candidate =>
           taskWindowStart <= candidate && candidate < taskWindowEnd);
@@ -753,6 +761,7 @@ tr.exportTo('tr.metrics.sh', function() {
         return {
           value: refinedFirstInteractive,
           diagnostics: {
+            navigationStart: new tr.v.d.Generic(taskWindowStart),
             tti: new tr.v.d.Generic(refinedFirstInteractive - taskWindowStart),
             searchBegin: new tr.v.d.Generic(firstCandidate),
             fcp: new tr.v.d.Generic(getFCPInWindow(taskWindowStart, taskWindowEnd, fcpTimestamps))
@@ -898,7 +907,7 @@ tr.exportTo('tr.metrics.sh', function() {
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
 
     for (var i = 0; i < navStartTimestamps.length; i++) {
-      // Get our window of interest. A window begings at a navigationStart, and
+      // Get our window of interest. A window begins at a navigationStart, and
       // ends either at the next navigationStart, and when we reach end of
       // tracing.
       var taskWindowStart = navStartTimestamps[i];
@@ -924,58 +933,49 @@ tr.exportTo('tr.metrics.sh', function() {
       var startTime = firstCandidate;
       var endTime = networkForwardSearchFirstInteractive;
 
-      tasks = mainThreadTasks.filter(
+      if (endTime === null) {
+        // Couldn't find firstInteractive
+        return null;
+      }
+
+      // Otherwise in the best possible case, the site was always interactive.
+      var firstInteractive = firstCandidate;
+
+      var tasks = mainThreadTasks.filter(
           t => t.end >= firstCandidate &&
           t.start <= networkForwardSearchFirstInteractive);
+      tasks.sort((a, b) => a.start - b.start);
 
+      var endpoints = [];
       endpoints.push(startTime);
-      endpoints.push(endTime - windowSize);
+      endpoints.push(endTime - eqtWindowSize);
       for (var task of tasks) {
-        endpoints.push(task.start - windowSize);
+        endpoints.push(task.start - eqtWindowSize);
         endpoints.push(task.start);
-        endpoints.push(task.end - windowSize);
+        endpoints.push(task.end - eqtWindowSize);
         endpoints.push(task.end);
       }
       endpoints = endpoints.filter(
-        x => (startTime <= x && x + windowSize <= endTime));
-      endpoints.sort((a, b) => a - b);
+        x => (startTime <= x && x + eqtWindowSize <= endTime));
+      // Sort in Descending order
+      endpoints.sort((a, b) => b - a);
 
+      var slidingWindow = new tr.e.chrome.SlidingWindow(
+        endpoints[0], eqtWindowSize, tasks);
 
-      // TODO: Continue from here tomorrow. We need to be looking backward for a period of high eqt. 
-      // Now look backward for a window of eqtWindowSize ms such that with mean
-      // EQT less than eqtThreshold
-
-      // We don't really care about interactiveBeginnings beyond networkReverseFirstInteractive
-      // Fingers crossed we don't get bit by floating point errors.
-      // I don't want to preemptively add an epsilon here, but pls do if bugs show up
-      interactivePeriodBeginnings = interactivePeriodBeginnings.filter(
-          t => t <= networkReverseFirstInteractive);
-
-      if (interactivePeriodBeginnings.length === 0) return null;
-      if (networkReverseFirstInteractive === null) return null;
-      // console.log(interactivePeriodBeginnings);
-      // console.log(networkReverseFirstInteractive);
-      if (interactivePeriodBeginnings[interactivePeriodBeginnings.length - 1] !== networkReverseFirstInteractive) {
-        throw new Error("This should not happen");
-      }
-
-      // TODO: Now starting from the end, see if EQT between two interactive points is lower than 25ms.
-      var j = interactivePeriodBeginnings.length - 1;
-      for (var j = interactivePeriodBeginnings.length - 1; j >= 1; j--) {
-        // This gets the EQT (as in mean Queuing Time - not a percentile)
-        // between the two interactive beginnings.
-        // Since we know window start and ends are both ends of long tasks,
-        // we do not have to deal with window clippings
-        var eqt = getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1], interactivePeriodBeginnings[j]);
-        // console.log(`EQT between ${interactivePeriodBeginnings[j]} and ${interactivePeriodBeginnings[j - 1]}: ${eqt}`);
-        if (getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1],
-            interactivePeriodBeginnings[j]) > 25) {
-          return interactivePeriodBeginnings[j];
+      for (var endpoint of endpoints) {
+        slidingWindow.slideBackwards(endpoint);
+        if (slidingWindow.getEQT > eqtThreshold) {
+          firstInteractive = slidingWindow.range.max;
+          break;
         }
       }
-    }
 
-    return interactivePeriodBeginnings[0];
+      return {
+        value: firstInteractive
+      };
+
+    }
   }
 
 
@@ -1080,15 +1080,17 @@ tr.exportTo('tr.metrics.sh', function() {
               navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS, fcpTimestamps)],
           histograms.firstInteractiveFMPReverseSearchFromNetworkFirstInteractive);
 
-      // histograms.firstInteractiveNetRevEQT.addSample(
-      //     calculateFirstInteractiveNetRevEQT(
-      //         navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
-      //         INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveNetRevEQT(
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
+              INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks)],
+          histograms.firstInteractiveNetRevEQT);
 
-      // histograms.firstInteractiveNetRevHighEQTWindow.addSample(
-      //   calculateFirstInteractiveNetRevHighEQTWindow(
-      //     navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
-      //     INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks, 500, 25));
+      addSamplesToHistogram(
+          [calculateFirstInteractiveNetRevHighEQTWindow(
+              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
+              INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks, 500, 25)],
+          histograms.firstInteractiveNetRevHighEQTWindow);
     }
   }
 
