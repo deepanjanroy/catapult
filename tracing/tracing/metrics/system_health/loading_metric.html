@@ -24,6 +24,8 @@ tr.exportTo('tr.metrics.sh', function() {
   var timeDurationInMs_smallerIsBetter =
       tr.b.Unit.byName.timeDurationInMs_smallerIsBetter;
   var RelatedEventSet = tr.v.d.RelatedEventSet;
+  // Used to counter floating point errors
+  const epsilon = 0.1;
 
   // TODO(ksakamoto): This should be a method of tr.model.Event or one of its
   // subclasses.
@@ -430,30 +432,12 @@ tr.exportTo('tr.metrics.sh', function() {
     }
   }
 
-  function createExperimentalFirstInteractiveHistograms() {
-    return {
-      firstInteractiveFMP : createHistogram(
-        'firstInteractive-FMP'),
-      firstInteractiveFCP : createHistogram(
-        'firstInteractive-FCP'),
-      firstInteractiveStartNav : createHistogram(
-        'firstInteractive-StartNav'),
-      firstInteractiveFMPReverseSearch : createHistogram(
-        'firstInteractive-FMP-ReverseSearch'),
-      firstInteractiveFCPReverseSearch : createHistogram(
-        'firstInteractive-FCP-ReverseSearch'),
-      firstInteractiveStartNavReverseSearch: createHistogram(
-        'firstInteractive-StartNav-ReverseSearch'),
-      firstInteractiveFMPNetwork: createHistogram(
-        'firstInteractive-FMP-Network'),
-      firstInteractiveFMPReverseSearchFromNetworkFirstInteractive: createHistogram(
-        'firstInteractive-FMP-ReverseSearchFromNetworkFirstInteractive'),
-      firstInteractiveNetRevEQT: createHistogram(
-        'firstInteractiveNetRevEQT'),
-      firstInteractiveNetRevHighEQTWindow: createHistogram(
-        'firstInteractiveNetRevHighEQTWindow')
-    };
-
+  function addSamplesToExperimentalHistograms(samples, histogramMap, histogramName) {
+    if (!histogramMap.has(histogramName)) {
+      histogramMap.set(histogramName, createHistogram(histogramName));
+    }
+    const histogram = histogramMap.get(histogramName);
+    addSamplesToHistogram(samples, histogram);
   }
 
   function addRawSamplesToHistogram(rawSamples, histogram) {
@@ -483,108 +467,200 @@ tr.exportTo('tr.metrics.sh', function() {
     return numericArray.sort((a, b) => a - b);
   }
 
-  function findFirstInteractiveInRange(firstCandidate, windowEnd, longTasks, interactiveWindowSize) {
-    var longTasksInWindow = longTasks.filter(task =>
-        firstCandidate <= task.end && task.start <= windowEnd);
+  function getFISimpleForwardSearch(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
 
-    var quietWindowStart = firstCandidate;
-    for (var task of longTasksInWindow) {
-      if ((task.start - quietWindowStart) > interactiveWindowSize) {
+    const longTasksInWindow = mainThreadTasks.filter(task =>
+        task.duration >= 50 &&
+        searchBegin <= task.end &&
+        task.start <= windowEnd);
+
+    let quietWindowStart = searchBegin;
+    for (const task of longTasksInWindow) {
+      if ((task.start - quietWindowStart) > interactiveWindowSizeMs) {
         return quietWindowStart;
       }
       quietWindowStart = task.end;
     }
 
-    if ((windowEnd - quietWindowStart) > interactiveWindowSize) {
+    if ((windowEnd - quietWindowStart) > interactiveWindowSizeMs) {
       return quietWindowStart;
     }
 
     return null;
   }
 
-  /**
-   * Returns the first time a page becomes interactive. For the current
-   * experiment, only one value is returned even if there are multiple
-   * navigations.
-   */
-  function calculateFirstInteractiveForwardSearch(
-      navStartTimestamps, firstCandidates, longTasks, traceEnd, interactiveWindowSize) {
-    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
 
-    for (var i = 0; i < navStartTimestamps.length; i++) {
-      // Get our window of interest. A window begins at a navigationStart, and
-      // ends either at the next navigationStart, and when we reach end of
-      // tracing.
-      var taskWindowStart = navStartTimestamps[i];
-      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
-          navStartTimestamps[i + 1] : traceEnd;
+  function getFIReverseSearch(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
+    const longTasksInWindow = mainThreadTasks.filter(task =>
+        task.duration >= 50 &&
+        searchBegin <= task.end &&
+        task.start <= windowEnd);
 
-      // Get the firstInteractive candidates that lie within the current
-      // window.
-      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
-          taskWindowStart <= candidate && candidate < taskWindowEnd);
+    const possibleFirstInteractive = longTasksInWindow.length > 0 ?
+        longTasksInWindow[longTasksInWindow.length - 1].end : searchBegin;
 
-      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) is
-      // our window. If we find more than one, this is probably a bug and it's
-      // best to bail.
-      if (firstCandidatesInWindow.length > 1) return null;
-      if (firstCandidatesInWindow.length == 0) continue;
-
-      var firstInteractive = findFirstInteractiveInRange(
-          firstCandidatesInWindow[0], taskWindowEnd, longTasks, interactiveWindowSize);
-
-      if (firstInteractive !== null) {
-        return firstInteractive;
-      }
-    }
-
-    return null;
-  }
-
-
-  function findFirstIneractiveInRangeReverseSearch(firstCandidate, windowEnd, longTasks, interactiveWindowSize) {
-    var longTasksInWindow = longTasks.filter(task =>
-        firstCandidate <= task.end && task.start <= windowEnd);
-
-    var possibleFirstInteractive = longTasksInWindow.length > 0 ?
-        longTasksInWindow[longTasksInWindow.length - 1].end : firstCandidate;
-
-    if ((windowEnd - possibleFirstInteractive) >= interactiveWindowSize) {
+    if ((windowEnd - possibleFirstInteractive) >= interactiveWindowSizeMs) {
       return possibleFirstInteractive;
     }
 
     return null;
   }
 
-  function calculateFirstInteractiveReverseSearch(
-      navStartTimestamps, firstCandidates, longTasks, traceEnd, interactiveWindowSize) {
-    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+  function getFIForwardNetwork(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow} = kwargs;
 
-    for (var i = 0; i < navStartTimestamps.length; i++) {
-      // Get our window of interest. A window begings at a navigationStart, and
-      // ends either at the next navigationStart, and when we reach end of
-      // tracing.
-      var taskWindowStart = navStartTimestamps[i];
-      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
-          navStartTimestamps[i + 1] : traceEnd;
+    const longTasksInWindow = mainThreadTasks.filter(task =>
+        task.duration >= 50 &&
+        searchBegin <= task.end &&
+        task.start <= windowEnd);
 
-      // Get the firstInteractive candidates that lie within the current window.
-      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
-          taskWindowStart <= candidate && candidate < taskWindowEnd);
+    const requestsInSearchSpace = requestsInWindow.filter(req =>
+        searchBegin <= req.end && req.start <= windowEnd);
 
-      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
-      // window. If we find more than one, this is probably a bug and it's best to bail.
-      if (firstCandidatesInWindow.length > 1) return null;
-      if (firstCandidatesInWindow.length == 0) continue;
+    // timestamps of interest
+    const endpoints = [];
 
-      var firstInteractive = findFirstIneractiveInRangeReverseSearch(
-          firstCandidatesInWindow[0], taskWindowEnd, longTasks, interactiveWindowSize);
+    for (const task of longTasksInWindow) {
+      endpoints.push({
+        time: task.start,
+        type: "taskStart",
+        slice: task
+      });
+      endpoints.push({
+        time: task.end,
+        type: "taskEnd",
+        slice: task
+      });
+    };
 
-      if (firstInteractive !== null) return firstInteractive;
+    for (const req of requestsInSearchSpace) {
+      endpoints.push({
+        time: req.start,
+        type: "requestStart",
+        slice: req
+      });
+      endpoints.push({
+        time: req.end,
+        type: "requestEnd",
+        slice: req
+      });
+    }
+
+    endpoints.sort((a, b) => a.time - b.time);
+
+    let quietWindowStart = searchBegin;
+    let activeNetworkRequests = 0;
+
+    for (const timestamp of endpoints) {
+      switch(timestamp.type) {
+        case "taskStart":
+          if (timestamp.time - quietWindowStart >= interactiveWindowSizeMs &&
+              activeNetworkRequests <= activeRequestTolerance) {
+            return quietWindowStart;
+          }
+          quietWindowStart = Math.max(quietWindowStart, timestamp.slice.end);
+          break;
+        case "taskEnd":
+          // Nothing to do.
+          break;
+        case "requestStart":
+          activeNetworkRequests++;
+          break;
+        case "requestEnd":
+          // First check if we just exited a period of network business.
+          if (activeNetworkRequests > activeRequestTolerance) {
+            quietWindowStart = Math.max(quietWindowStart, timestamp.time);
+          }
+          activeNetworkRequests--;
+          break;
+      }
+    }
+
+    if (windowEnd - quietWindowStart >= interactiveWindowSizeMs &&
+        activeNetworkRequests <= activeRequestTolerance) {
+      return quietWindowStart;
     }
 
     return null;
   }
+
+  function getFIReverseFromNetworkFI(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow} = kwargs;
+
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    const kwargsCopy = Object.assign({}, kwargs);
+    kwargsCopy[windowEnd] = forwardNetworkFI + interactiveWindowSizeMs + epsilon;
+    const refinedFI = getFIReverseSearch(kwargsCopy);
+
+    // Sanity check: In the worst case, refinedFirstInteractive should be the
+    // same as original firstInteractive.
+    if (refinedFI === null) throw Error("This should never happen");
+
+    return refinedFI;
+  }
+
+  // This is the one where we search backwards from network TTI, but instead of
+  // strictly looking for long tasks, we look for windows with high EQT.
+  function getFIRevFromNetFIHighEqtWindow(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, eqtWindowSize, eqtThreshold} = kwargs;
+
+    // Get the network forward search firstInteractive.
+    // This is the right boundary of our quest for firstInteractive
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    // We're now only interested in the [searchBegin, forwardNetworkFI] range.
+    const startTime = searchBegin;
+    const endTime = forwardNetworkFI;
+
+    // In case the site has no window of high enough EQT, we start off assuming
+    // the site was always interactive, i.e. firstInteractive happens at the
+    // beginning of our search window.
+    let firstInteractive = searchBegin;
+
+    // All tasks in our current range of interest.
+    var tasks = mainThreadTasks.filter(
+        t => t.end >= startTime &&
+        t.start <= endTime);
+
+    var endpoints = [];
+    endpoints.push(startTime);
+    endpoints.push(endTime - eqtWindowSize);
+    for (var task of tasks) {
+      endpoints.push(task.start - eqtWindowSize);
+      endpoints.push(task.start);
+      endpoints.push(task.end - eqtWindowSize);
+      endpoints.push(task.end);
+    }
+    endpoints = endpoints.filter(
+      x => (startTime <= x && x + eqtWindowSize <= endTime));
+    // Sort in Descending order
+    endpoints.sort((a, b) => b - a);
+
+    var slidingWindow = new tr.e.chrome.SlidingWindow(
+      endpoints[0], eqtWindowSize, tasks);
+
+    for (var endpoint of endpoints) {
+      slidingWindow.slideBackwards(endpoint);
+      if (slidingWindow.getEQT > eqtThreshold) {
+        firstInteractive = slidingWindow.range.max;
+        break;
+      }
+    }
+
+    return firstInteractive;
+  }
+
 
   function getNetworkRequests(rendererHelper) {
     return rendererHelper.mainThread.asyncSliceGroup.slices.filter(slice =>
@@ -604,177 +680,8 @@ tr.exportTo('tr.metrics.sh', function() {
     return activeRequests;
   }
 
-  function findFirstIneractiveInRangeForwardSearchNetwork(
-      firstCandidate, windowEnd, longTasks, networkRequests, interactiveWindowSize) {
-    var activeNetworkRequestTolerance = 2;
-
-    var longTasksInWindow = longTasks.filter(task =>
-        firstCandidate <= task.end && task.start <= windowEnd);
-
-    var networkRequestsInWindow = networkRequests.filter(req =>
-        firstCandidate <= req.end && req.start <= windowEnd);
-    
-
-    var interestingTimeStamps = [];
-
-    for (var task of longTasksInWindow) {
-      interestingTimeStamps.push({
-        time: task.start,
-        type: "taskStart",
-        slice: task
-      });
-      interestingTimeStamps.push({
-        time: task.end,
-        type: "taskEnd",
-        slice: task
-      });
-    };
-
-    for (var req of networkRequestsInWindow) {
-      interestingTimeStamps.push({
-        time: req.start,
-        type: "requestStart",
-        slice: req
-      });
-      interestingTimeStamps.push({
-        time: req.end,
-        type: "requestEnd",
-        slice: req
-      });
-    }
-
-    interestingTimeStamps.sort((a, b) => a.time - b.time);
-
-    var quietWindowStart = firstCandidate;
-    var activeNetworkRequests = 0;
-
-    for (var timestamp of interestingTimeStamps) {
-      switch(timestamp.type) {
-        case "taskStart":
-          if (timestamp.time - quietWindowStart >= interactiveWindowSize &&
-              activeNetworkRequests <= activeNetworkRequestTolerance) {
-            return quietWindowStart;
-          }
-          quietWindowStart = Math.max(quietWindowStart, timestamp.slice.end);
-          break;
-        case "taskEnd":
-          // Nothing to do.
-          break;
-        case "requestStart":
-          activeNetworkRequests++;
-          break;
-        case "requestEnd":
-          // First check if we just exited a period of network business.
-          if (activeNetworkRequests > activeNetworkRequestTolerance) {
-            quietWindowStart = Math.max(quietWindowStart, timestamp.time);
-          }
-          activeNetworkRequests--;
-          break;
-      }
-    }
-
-    if (windowEnd - quietWindowStart >= interactiveWindowSize &&
-        activeNetworkRequests <= activeNetworkRequestTolerance) {
-      return quietWindowStart;
-    }
-
-    return null;
-  }
-
-  function calculateFirstInteractiveForwardSearchNetwork(
-    navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize) {
-    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
-
-    for (var i = 0; i < navStartTimestamps.length; i++) {
-      // Get our window of interest. A window begings at a navigationStart, and
-      // ends either at the next navigationStart, and when we reach end of
-      // tracing.
-      var taskWindowStart = navStartTimestamps[i];
-      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
-          navStartTimestamps[i + 1] : traceEnd;
-
-      // Get the firstInteractive candidates that lie within the current window.
-      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
-          taskWindowStart <= candidate && candidate < taskWindowEnd);
-
-      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
-      // window. If we find more than one, this is probably a bug and it's best to bail.
-      if (firstCandidatesInWindow.length > 1) return null;
-      if (firstCandidatesInWindow.length == 0) continue;
-
-      var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
-          firstCandidatesInWindow[0], taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
-
-      if (firstInteractive !== null) {
-        return firstInteractive;
-      }
-    }
-
-    return null;
-  }
-
-
-  function getFCPInWindow(windowStart, windowEnd, fcpTimestamps) {
-    var fcpsInWindow = fcpTimestamps.filter(t => windowStart <= t && t < windowEnd);
-    if (fcpsInWindow.length > 1 || fcpsInWindow.length == 0) return null;
-    return fcpsInWindow[0];
-  }
-
-
-  // This is networkReverseSearch
-  function calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
-      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize, fcpTimestamps) {
-    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
-
-    for (var i = 0; i < navStartTimestamps.length; i++) {
-      // Get our window of interest. A window begings at a navigationStart, and
-      // ends either at the next navigationStart, and when we reach end of
-      // tracing.
-      var taskWindowStart = navStartTimestamps[i];
-      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
-          navStartTimestamps[i + 1] : traceEnd;
-
-
-      // Get the firstInteractive candidates that lie within the current window.
-      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
-          taskWindowStart <= candidate && candidate < taskWindowEnd);
-
-      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
-      // window. If we find more than one, this is probably a bug and it's best to bail.
-      if (firstCandidatesInWindow.length > 1) return null;
-      if (firstCandidatesInWindow.length == 0) continue;
-      var firstCandidate = firstCandidatesInWindow[0];
-
-      var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
-          firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
-
-      if (firstInteractive !== null) {
-        // Now do a reverseSearch.
-        var smallEpsilon = 0.1  // Used to counter floating point errors.
-        var refinedFirstInteractive = findFirstIneractiveInRangeReverseSearch(
-            firstCandidate, firstInteractive + interactiveWindowSize + smallEpsilon, longTasks, interactiveWindowSize);
-        if (refinedFirstInteractive === null) {
-          // In the worst case, refinedFirstInteractive should be the same as original
-          // firstInteractive.
-          throw Error("This should never happen");
-        }
-        return {
-          value: refinedFirstInteractive,
-          diagnostics: {
-            navigationStart: new tr.v.d.Generic(taskWindowStart),
-            tti: new tr.v.d.Generic(refinedFirstInteractive - taskWindowStart),
-            searchBegin: new tr.v.d.Generic(firstCandidate),
-            fcp: new tr.v.d.Generic(getFCPInWindow(taskWindowStart, taskWindowEnd, fcpTimestamps))
-          }
-        };
-      }
-    }
-
-    return null;
-  }
-
   function getInteractivePeriodBeginnings(
-    firstCandidate, taskWindowEnd, longTasks, interactiveWindowSize) {
+    firstCandidate, taskWindowEnd, longTasks, interactiveWindowSizeMs) {
     var longTasksInWindow = longTasks.filter(task =>
         firstCandidate <= task.end && task.start <= taskWindowEnd);
 
@@ -782,13 +689,13 @@ tr.exportTo('tr.metrics.sh', function() {
 
     var quietWindowStart = firstCandidate;
     for (var task of longTasksInWindow) {
-      if ((task.start - quietWindowStart) > interactiveWindowSize) {
+      if ((task.start - quietWindowStart) > interactiveWindowSizeMs) {
         interactivePeriodBeginnings.push(quietWindowStart);
       }
       quietWindowStart = task.end;
     }
 
-    if ((taskWindowEnd - quietWindowStart) > interactiveWindowSize) {
+    if ((taskWindowEnd - quietWindowStart) > interactiveWindowSizeMs) {
       interactivePeriodBeginnings.push(quietWindowStart);
     }
 
@@ -797,15 +704,15 @@ tr.exportTo('tr.metrics.sh', function() {
 
   // Duplicated code from network reverse search to use in the eqt based optimistic tti.
   function findNetworkReverseSearchFirstInteractive(
-      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize) {
+      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSizeMs) {
     var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
-      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
+      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSizeMs);
 
     if (firstInteractive !== null) {
       // Now do a reverseSearch.
       var smallEpsilon = 0.1  // Used to counter floating point errors.
       var refinedFirstInteractive = findFirstIneractiveInRangeReverseSearch(
-        firstCandidate, firstInteractive + interactiveWindowSize + smallEpsilon, longTasks, interactiveWindowSize);
+        firstCandidate, firstInteractive + interactiveWindowSizeMs + smallEpsilon, longTasks, interactiveWindowSizeMs);
       if (refinedFirstInteractive === null) {
         // In the worst case, refinedFirstInteractive should be the same as original
         // firstInteractive.
@@ -831,9 +738,10 @@ tr.exportTo('tr.metrics.sh', function() {
 
   // This is the one where we look at the EQT between two potential
   // firstInteractive candidates and if the EQT is low enough we take the
-  // earlier one.
+  // earlier one. Currently unused but code not deleted because the code can
+  // potentially be useful later.
   function calculateFirstInteractiveNetRevEQT(
-      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize,
+      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSizeMs,
       mainThreadTasks) {
 
     if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
@@ -863,7 +771,7 @@ tr.exportTo('tr.metrics.sh', function() {
       // Get the network reverse search firstInteractive.
       // This is the right boundary of our quest for firstInteractive
       var networkReverseFirstInteractive = findNetworkReverseSearchFirstInteractive(
-        firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
+        firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSizeMs);
 
       // We don't really care about interactiveBeginnings beyond networkReverseFirstInteractive
       // Fingers crossed we don't get bit by floating point errors.
@@ -898,87 +806,6 @@ tr.exportTo('tr.metrics.sh', function() {
     return interactivePeriodBeginnings[0];
   }
 
-  // This is the one where we search backwards from network TTI, but instead of
-  // strictly looking for long tasks, we look for windows with high EQT.
-  function calculateFirstInteractiveNetRevHighEQTWindow(
-      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSize,
-      mainThreadTasks, eqtWindowSize, eqtThreshold) {
-
-    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
-
-    for (var i = 0; i < navStartTimestamps.length; i++) {
-      // Get our window of interest. A window begins at a navigationStart, and
-      // ends either at the next navigationStart, and when we reach end of
-      // tracing.
-      var taskWindowStart = navStartTimestamps[i];
-      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
-          navStartTimestamps[i + 1] : traceEnd;
-
-      // Get the firstInteractive candidates that lie within the current window.
-      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
-          taskWindowStart <= candidate && candidate < taskWindowEnd);
-
-      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
-      // window. If we find more than one, this is probably a bug and it's best to bail.
-      if (firstCandidatesInWindow.length > 1) return null;
-      if (firstCandidatesInWindow.length == 0) continue;
-      var firstCandidate = firstCandidatesInWindow[0];
-
-      // Get the network forward search firstInteractive.
-      // This is the right boundary of our quest for firstInteractive
-      var networkForwardSearchFirstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
-        firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSize);
-
-      // We're only interested in the [firstCandidate, networkForwardSearchFirstInteractive] range
-      var startTime = firstCandidate;
-      var endTime = networkForwardSearchFirstInteractive;
-
-      if (endTime === null) {
-        // Couldn't find firstInteractive
-        return null;
-      }
-
-      // Otherwise in the best possible case, the site was always interactive.
-      var firstInteractive = firstCandidate;
-
-      var tasks = mainThreadTasks.filter(
-          t => t.end >= firstCandidate &&
-          t.start <= networkForwardSearchFirstInteractive);
-      tasks.sort((a, b) => a.start - b.start);
-
-      var endpoints = [];
-      endpoints.push(startTime);
-      endpoints.push(endTime - eqtWindowSize);
-      for (var task of tasks) {
-        endpoints.push(task.start - eqtWindowSize);
-        endpoints.push(task.start);
-        endpoints.push(task.end - eqtWindowSize);
-        endpoints.push(task.end);
-      }
-      endpoints = endpoints.filter(
-        x => (startTime <= x && x + eqtWindowSize <= endTime));
-      // Sort in Descending order
-      endpoints.sort((a, b) => b - a);
-
-      var slidingWindow = new tr.e.chrome.SlidingWindow(
-        endpoints[0], eqtWindowSize, tasks);
-
-      for (var endpoint of endpoints) {
-        slidingWindow.slideBackwards(endpoint);
-        if (slidingWindow.getEQT > eqtThreshold) {
-          firstInteractive = slidingWindow.range.max;
-          break;
-        }
-      }
-
-      return {
-        value: firstInteractive
-      };
-
-    }
-  }
-
-
   function findMainLoadingFrames(traceObjects) {
     var frameLoaderInstances = traceObjects.instancesByTypeName_['FrameLoader'];
     var mainFrames = [];
@@ -991,112 +818,214 @@ tr.exportTo('tr.metrics.sh', function() {
     frameLoaderInstances.map(oi => oi.modelItem.snapshots.map(s => s.args.isLoadingMainFrame))
   }
 
-  function addExperimentalFirstInteractiveSamples(histograms, loadingMetrics, rendererHelper) {
-    var navigationStartEvents = getNavStartEvents(rendererHelper).filter(event => {
-      // Only find navigationStart events for the main loading frame
+  // Only returns navigationStart events for the main loading frame
+  function getMainFrameNavStartEvents(rendererHelper) {
+    return getNavStartEvents(rendererHelper).filter(event => {
       var frameIdRef = event.args['frame'];
       var snapshot = findFrameLoaderSnapshotAt(rendererHelper, frameIdRef, event.start);
       return snapshot && snapshot.args.isLoadingMainFrame;
     });
-    navigationStartEvents.sort((a, b) => a.start - b.start);
+  }
 
-
+  function getNavStartTimesByFrame(navStartEvents) {
     var navStartTimesByFrame = new Map();
-    for (var e of navigationStartEvents) {
+    for (var e of navStartEvents) {
       var navStartTimestamps = navStartTimesByFrame.get(e.args.frame) || [];
       navStartTimestamps.push(e.start);
       navStartTimesByFrame.set(e.args.frame, navStartTimestamps);
     }
+    return navStartTimesByFrame;
+  }
 
+  function getFMPTimestampsByFrame(fmpSamples) {
     var fmpTimestampsByFrame = new Map();
-    for (var sample of loadingMetrics.firstMeaningfulPaintSamples) {
+    for (var sample of fmpSamples) {
       var frame = sample.diagnostics['Navigation infos'].value.frame;
       var time = sample.diagnostics['Navigation infos'].value.fmp;
       var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
       fmpTimestamps.push(time);
       fmpTimestampsByFrame.set(frame, fmpTimestamps);
     }
+    return fmpTimestampsByFrame;
+  }
 
+  function getFCPTimestampsByFrame(fcpSamples) {
     var fcpTimestampsByFrame = new Map();
-    for (var sample of loadingMetrics.firstContentfulPaintSamples) {
+    for (var sample of fcpSamples) {
       var frame = sample.diagnostics.frame.value;
       var time = sample.diagnostics.eventTimestamp.value;
       var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
       fcpTimestamps.push(time);
       fcpTimestampsByFrame.set(frame, fcpTimestamps);
     }
+    return fcpTimestampsByFrame;
+  }
 
-    var networkRequests = getNetworkRequests(rendererHelper);
+  function getUniqueInWindow(ts, windowStart, windowEnd) {
+    const filteredTs = ts.filter(t => windowStart <= t && t < windowEnd);
+
+    // We make sure we have only one ts (which is usually FMP/FCP/DCL) in
+    // our window. If we find more than one, this is probably a bug and
+    // it's best to fail loudly and figure out the underlying issue.
+    if (filteredTs.length > 1) throw Error("More than one");
+    if (filteredTs.length == 0) return null;
+
+    return filteredTs[0];
+  }
+
+  function anyNull(xs) {
+    for (const x of xs) if (x === null) return true;
+    return false;
+  }
+
+  function addExperimentalFirstInteractiveHistograms(histogramMap, loadingMetrics, rendererHelper) {
+    const navStartEvents = getMainFrameNavStartEvents(rendererHelper).filter(event => {
+      // Only find navigationStart events for the main loading frame
+      var frameIdRef = event.args['frame'];
+      var snapshot = findFrameLoaderSnapshotAt(rendererHelper, frameIdRef, event.start);
+      return snapshot && snapshot.args.isLoadingMainFrame;
+    });
+    navStartEvents.sort((a, b) => a.start - b.start);
+
+    const navStartTimesByFrame = getNavStartTimesByFrame(navStartEvents);
+    const fmpTimestampsByFrame =
+        getFMPTimestampsByFrame(loadingMetrics.firstMeaningfulPaintSamples);
+    const fcpTimestampsByFrame =
+        getFCPTimestampsByFrame(loadingMetrics.firstContentfulPaintSamples);
+
+    const networkRequests = getNetworkRequests(rendererHelper);
     networkRequests.sort((a, b) => a.end - b.end);
 
-    var mainThreadTasks = [];
-    var longTasks = [];
+    const mainThreadTasks = [];
     for (var e of rendererHelper.mainThread.sliceGroup.childEvents()) {
       if (e.title === 'TaskQueueManager::ProcessTaskFromWorkQueue') {
         mainThreadTasks.push(e);
       }
     }
     mainThreadTasks.sort((a, b) => a.start - b.start);
-    longTasks = mainThreadTasks.filter(t => t.duration > RESPONSIVENESS_THRESHOLD_MS);
 
     var traceEnd = rendererHelper.modelHelper.model.bounds.max;
+
 
     for (var [frame, navStartTimestamps] of navStartTimesByFrame) {
       var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
       var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveForwardSearch(
-            navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
-           histograms.firstInteractiveFMP);
+      for (var i = 0; i < navStartTimestamps.length; i++) {
+        // Get our window of interest. A window begins at a navigationStart, and
+        // ends either at the next navigationStart, and when we reach end of
+        // tracing.
+        const windowStart = navStartTimestamps[i];
+        const windowEnd = i + 1 < navStartTimestamps.length ?
+            navStartTimestamps[i + 1] : traceEnd;
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveForwardSearch(
-              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
-           histograms.firstInteractiveFCP);
+        const getUniqueInCurrentWindow = ts => getUniqueInWindow(ts, windowStart, windowEnd);
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, fmpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
-          histograms.firstInteractiveFMPReverseSearch);
+        const fmp = getUniqueInCurrentWindow(fmpTimestamps);
+        const fcp = getUniqueInCurrentWindow(fcpTimestamps);
+        // We need this navigation to at least reach FCP and FMP.
+        if (anyNull([fmp, fcp])) continue;
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, fcpTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
-          histograms.firstInteractiveFCPReverseSearch);
+        // All metric calculations should be restricted to objects in the
+        // current window.
+        const tasksInWindow = mainThreadTasks.filter(t =>
+              windowStart <= t.end && t.start <= windowEnd);
+        const requestsInWindow = networkRequests.filter(r =>
+            windowStart <= r.end && r.start <= windowEnd);
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveReverseSearch(
-              navStartTimestamps, navStartTimestamps, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
-          histograms.firstInteractiveStartNavReverseSearch);
+        // Convenient shortcut function.
+        // This function is a no-op if sample is null
+        const addWithDiagnostics = (name, sample) => {
+          const sampleWithDiagnostics = {
+            value: sample,
+            diagnostics: {
+              navigationStart: new tr.v.d.Generic(windowStart),
+              tti: new tr.v.d.Generic(sample - windowStart),
+              fmp: new tr.v.d.Generic(fmp),
+              fcp: new tr.v.d.Generic(fcp)
+            }
+          };
+          addSamplesToExperimentalHistograms(
+              [sampleWithDiagnostics], histogramMap, name);
+        }
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveForwardSearchNetwork(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS)],
-          histograms.firstInteractiveFMPNetwork);
+        addWithDiagnostics('firstInteractive-FMP',
+            getFISimpleForwardSearch({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000
+            }));
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveReverseSearchFromNetworkFirstInteractive(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd, INTERACTIVE_WINDOW_SIZE_MS, fcpTimestamps)],
-          histograms.firstInteractiveFMPReverseSearchFromNetworkFirstInteractive);
+        addWithDiagnostics('firstInteractive-FCP',
+            getFISimpleForwardSearch({
+              searchBegin: fcp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000
+            }));
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveNetRevEQT(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
-              INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks)],
-          histograms.firstInteractiveNetRevEQT);
+        addWithDiagnostics('firstInteractive-FMP-ReverseSearch',
+            getFIReverseSearch({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000
+            }));
 
-      addSamplesToHistogram(
-          [calculateFirstInteractiveNetRevHighEQTWindow(
-              navStartTimestamps, fmpTimestamps, networkRequests, longTasks, traceEnd,
-              INTERACTIVE_WINDOW_SIZE_MS, mainThreadTasks, 500, 25)],
-          histograms.firstInteractiveNetRevHighEQTWindow);
+        addWithDiagnostics('firstInteractive-FCP-ReverseSearch',
+            getFIReverseSearch({
+              searchBegin: fcp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000
+            }));
+
+        addWithDiagnostics('firstInteractive-FMP-Network',
+            getFIForwardNetwork({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000,
+              requestsInWindow: requestsInWindow,
+              activeRequestTolerance: 2
+            }));
+
+        addWithDiagnostics(
+            'firstInteractive-FMP-ReverseSearchFromNetworkFirstInteractive',
+            getFIReverseFromNetworkFI({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000,
+              requestsInWindow: requestsInWindow,
+              activeRequestTolerance: 2
+            }));
+
+        for (let windowSize = 350; windowSize <= 500; windowSize += 50) {
+          for (let eqtThreshold = 8; eqtThreshold <= 12; eqtThreshold += 1) {
+            const metricName = 'firstInteractiveNetRevHighEQTWindow-' +
+                `ws-${windowSize}-et-${eqtThreshold}`;
+            addWithDiagnostics(metricName,
+                getFIRevFromNetFIHighEqtWindow({
+                  searchBegin: fmp,
+                  windowEnd: windowEnd,
+                  mainThreadTasks: mainThreadTasks,
+                  interactiveWindowSizeMs: 5000,
+                  requestsInWindow: requestsInWindow,
+                  activeRequestTolerance: 2,
+                  eqtWindowSize: windowSize,
+                  eqtThreshold: eqtThreshold
+                }));
+          }
+        }
+      }
     }
   }
 
   function addExperimentalHistogramsToValues(values, histograms) {
-    for (var name in histograms) {
-      values.addHistogram(histograms[name]);
+    for (var h of histograms.values()) {
+      values.addHistogram(h);
     }
   }
 
@@ -1118,10 +1047,12 @@ tr.exportTo('tr.metrics.sh', function() {
         'CPU time to first meaningful paint';
     var firstInteractiveHistogram = createHistogram('timeToFirstInteractive');
     firstInteractiveHistogram.description = 'time to first interactive';
-    var experimentalHistograms = createExperimentalFirstInteractiveHistograms();
 
     var chromeHelper = model.getOrCreateHelper(
         tr.model.helpers.ChromeModelHelper);
+
+    const experimentalHistograms = new Map();
+
     for (var pid in chromeHelper.rendererHelpers) {
       var rendererHelper = chromeHelper.rendererHelpers[pid];
       if (rendererHelper.isChromeTracingUI) continue;
@@ -1140,9 +1071,9 @@ tr.exportTo('tr.metrics.sh', function() {
           firstMeaningfulPaintCpuTimeHistogram);
       addSamplesToHistogram(firstInteractiveSamples,
           firstInteractiveHistogram);
-
-      addExperimentalFirstInteractiveSamples(experimentalHistograms, rendererLoadingMetrics, rendererHelper);
+      addExperimentalFirstInteractiveHistograms(experimentalHistograms, rendererLoadingMetrics, rendererHelper);
     }
+
 
     values.addHistogram(firstContentfulPaintHistogram);
     values.addHistogram(onLoadHistogram);
