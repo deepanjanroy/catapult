@@ -469,9 +469,10 @@ tr.exportTo('tr.metrics.sh', function() {
 
   function getFISimpleForwardSearch(kwargs) {
     const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
+    const longTaskThreshold = kwargs.longTaskThreshold || 50;
 
     const longTasksInWindow = mainThreadTasks.filter(task =>
-        task.duration >= 50 &&
+        task.duration >= longTaskThreshold &&
         searchBegin <= task.end &&
         task.start <= windowEnd);
 
@@ -490,6 +491,49 @@ tr.exportTo('tr.metrics.sh', function() {
     return null;
   }
 
+  // function getSimpleQuietRanges(kwargs) {
+  //   const {longTasks, windowEnd, quietWindowLength, durationThreshold} = kwargs;
+  //   for (let i = 0; i < longTasks.length; i++) {
+  //     const currTask = longTasks[i];
+  //     const nextTask = longTas
+  //   }
+  // }
+
+  // function getFILayeredForwardSearch(kwargs) {
+  //   const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
+
+  //   const longTaskThreshold = kwargs.longTaskThreshold || 50;
+  //   const longTasksInWindow = mainThreadTasks.filter(task =>
+  //                                                    task.duration >= longTaskThreshold &&
+  //                                                    searchBegin <= task.end &&
+  //                                                    task.start <= windowEnd);
+
+  //   const getSimpleQuietRanges({
+  //     longTasks: longTasksInWindow,
+  //     windowEnd: windowEnd,
+  //     quietWindowLength: 1000,
+  //     durationThreshold: 16,
+  //   });
+
+  //   const reallyQuietFI = getFISimpleForwardSearch({
+  //     windowEnd,
+  //     mainThreadTasks,
+  //     searchBegin: simpleFI,
+  //     interactiveWindowSizeMs: 1000
+  //   })
+  //   for (const task of longTasksInWindow) {
+  //     if ((task.start - quietWindowStart) > interactiveWindowSizeMs) {
+  //       return quietWindowStart;
+  //     }
+  //     quietWindowStart = task.end;
+  //   }
+
+  //   if ((windowEnd - quietWindowStart) > interactiveWindowSizeMs) {
+  //     return quietWindowStart;
+  //   }
+
+  //   return null;
+  // }
 
   function getFIReverseSearch(kwargs) {
     const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
@@ -661,6 +705,80 @@ tr.exportTo('tr.metrics.sh', function() {
     return firstInteractive;
   }
 
+  function getFIForwardSlideInHighEQTWindow(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, eqtWindowSize, eqtThreshold} = kwargs;
+
+    const backwardHighEQTFI = getFIRevFromNetFIHighEqtWindow(kwargs);
+    if (backwardHighEQTFI === null) return null;
+    const firstInteractiveFirst = getFISimpleForwardSearch({
+      searchBegin: Math.max(backwardHighEQTFI - eqtWindowSize, searchBegin),
+      windowEnd: windowEnd,
+      mainThreadTasks: mainThreadTasks,
+      interactiveWindowSizeMs: 100
+    })
+    if (firstInteractiveFirst === null) return null;
+    const firstInteractiveSecond = getFISimpleForwardSearch({
+      searchBegin: firstInteractiveFirst,
+      windowEnd: windowEnd,
+      mainThreadTasks: mainThreadTasks,
+      interactiveWindowSizeMs: 10,
+      longTaskThreshold: 5
+    })
+
+    return firstInteractiveSecond;
+  }
+
+  function isLonely(longTasks, index, windowSize) {
+    if (index >= longTasks.length || index < 0) {
+      throw Error("index not in longTasks array");
+    } 
+
+    const currTask = longTasks[index];
+    const nextTask = index + 1 === longTasks.length
+          ? null : longTasks[index + 1];
+    const prevTask = index === 0
+          ? null : longTasks[index - 1];
+
+    const lonelyForward =
+          nextTask === null
+          || nextTask.start - currTask.end > windowSize;
+    const lonelyBackward =
+          prevTask === null
+          || currTask.start - prevTask.end >= windowSize;
+
+    return lonelyForward && lonelyBackward;
+  }
+
+  function getFINetRevLonelyTask(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, lonelyWindowSizeMs,
+           longTaskAbsoluteThreshold} = kwargs;
+
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    const longTasksUntilNetFI = mainThreadTasks.filter(t =>
+        t.duration >= 50 &&
+        t.end >= searchBegin &&
+        t.start <= forwardNetworkFI
+    );
+
+    if (longTasksUntilNetFI.length === 0) return searchBegin;
+
+    let i = longTasksUntilNetFI.length - 1;
+    while(i >= 0) {
+      // Stop if current task is too long
+      if (longTasksUntilNetFI[i].duration > longTaskAbsoluteThreshold) break;
+      // Stop if current task another long task nearby
+      if (!isLonely(longTasksUntilNetFI, i, lonelyWindowSizeMs)) break;
+      i--;
+    }
+
+    return i < 0 ? searchBegin : longTasksUntilNetFI[i].end;
+  }
 
   function getNetworkRequests(rendererHelper) {
     return rendererHelper.mainThread.asyncSliceGroup.slices.filter(slice =>
@@ -957,13 +1075,32 @@ tr.exportTo('tr.metrics.sh', function() {
               interactiveWindowSizeMs: 5000
             }));
 
-        addWithDiagnostics('firstInteractive-FCP',
-            getFISimpleForwardSearch({
-              searchBegin: fcp,
-              windowEnd: windowEnd,
-              mainThreadTasks: mainThreadTasks,
-              interactiveWindowSizeMs: 5000
-            }));
+        for (let windowSize = 1000; windowSize <= 5000; windowSize += 1000) {
+          addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize,
+              getFISimpleForwardSearch({
+                searchBegin: fmp,
+                windowEnd: windowEnd,
+                mainThreadTasks: mainThreadTasks,
+                interactiveWindowSizeMs: windowSize
+              }));
+        }
+
+        // addWithDiagnostics('firstInteractive-FMP-1s',
+        //     getFILayeredForwardSearch({
+        //       searchBegin: fmp,
+        //       windowEnd: windowEnd,
+        //       mainThreadTasks: mainThreadTasks,
+        //       interactiveWindowSizeMs: 1000
+        //     }));
+
+
+        // addWithDiagnostics('firstInteractive-FCP',
+        //     getFISimpleForwardSearch({
+        //       searchBegin: fcp,
+        //       windowEnd: windowEnd,
+        //       mainThreadTasks: mainThreadTasks,
+        //       interactiveWindowSizeMs: 5000
+        //     }));
 
         addWithDiagnostics('firstInteractive-FMP-ReverseSearch',
             getFIReverseSearch({
@@ -973,13 +1110,13 @@ tr.exportTo('tr.metrics.sh', function() {
               interactiveWindowSizeMs: 5000
             }));
 
-        addWithDiagnostics('firstInteractive-FCP-ReverseSearch',
-            getFIReverseSearch({
-              searchBegin: fcp,
-              windowEnd: windowEnd,
-              mainThreadTasks: mainThreadTasks,
-              interactiveWindowSizeMs: 5000
-            }));
+        // addWithDiagnostics('firstInteractive-FCP-ReverseSearch',
+        //     getFIReverseSearch({
+        //       searchBegin: fcp,
+        //       windowEnd: windowEnd,
+        //       mainThreadTasks: mainThreadTasks,
+        //       interactiveWindowSizeMs: 5000
+        //     }));
 
         addWithDiagnostics('firstInteractive-FMP-Network',
             getFIForwardNetwork({
@@ -1002,23 +1139,52 @@ tr.exportTo('tr.metrics.sh', function() {
               activeRequestTolerance: 2
             }));
 
-        for (let windowSize = 350; windowSize <= 500; windowSize += 50) {
-          for (let eqtThreshold = 8; eqtThreshold <= 12; eqtThreshold += 1) {
-            const metricName = 'firstInteractiveNetRevHighEQTWindow-' +
-                `ws-${windowSize}-et-${eqtThreshold}`;
-            addWithDiagnostics(metricName,
-                getFIRevFromNetFIHighEqtWindow({
-                  searchBegin: fmp,
-                  windowEnd: windowEnd,
-                  mainThreadTasks: mainThreadTasks,
-                  interactiveWindowSizeMs: 5000,
-                  requestsInWindow: requestsInWindow,
-                  activeRequestTolerance: 2,
-                  eqtWindowSize: windowSize,
-                  eqtThreshold: eqtThreshold
-                }));
-          }
-        }
+        // for (let windowSize = 350; windowSize <= 500; windowSize += 50) {
+        //   for (let eqtThreshold = 8; eqtThreshold <= 12; eqtThreshold += 1) {
+        //     const metricName = 'firstInteractiveNetRevHighEQTWindow-' +
+        //         `ws-${windowSize}-et-${eqtThreshold}`;
+        //     addWithDiagnostics(metricName,
+        //         getFIRevFromNetFIHighEqtWindow({
+        //           searchBegin: fmp,
+        //           windowEnd: windowEnd,
+        //           mainThreadTasks: mainThreadTasks,
+        //           interactiveWindowSizeMs: 5000,
+        //           requestsInWindow: requestsInWindow,
+        //           activeRequestTolerance: 2,
+        //           eqtWindowSize: windowSize,
+        //           eqtThreshold: eqtThreshold
+        //         }));
+        //   }
+        // }
+
+        addWithDiagnostics(
+          'firstInteractiveForwardSlideInHighEQTWindow',
+          getFIForwardSlideInHighEQTWindow({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            interactiveWindowSizeMs: 5000,
+            requestsInWindow: requestsInWindow,
+            activeRequestTolerance: 2,
+            // These valued looked good enough in brute force search
+            eqtWindowSize: 350,
+            eqtThreshold: 12
+          })
+        );
+
+        addWithDiagnostics(
+          'firstInteractiveNetRevLonelyTask',
+          getFINetRevLonelyTask({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            interactiveWindowSizeMs: 5000,
+            requestsInWindow: requestsInWindow,
+            activeRequestTolerance: 2,
+            lonelyWindowSizeMs: 2000,
+            longTaskAbsoluteThreshold: 250
+          })
+        );
       }
     }
   }
