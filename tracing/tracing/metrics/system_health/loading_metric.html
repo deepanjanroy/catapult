@@ -733,7 +733,7 @@ tr.exportTo('tr.metrics.sh', function() {
   function isLonely(longTasks, index, windowSize) {
     if (index >= longTasks.length || index < 0) {
       throw Error("index not in longTasks array");
-    } 
+    }
 
     const currTask = longTasks[index];
     const nextTask = index + 1 === longTasks.length
@@ -754,7 +754,36 @@ tr.exportTo('tr.metrics.sh', function() {
   function getFINetRevLonelyTask(kwargs) {
     const {searchBegin, windowEnd, mainThreadTasks,
            interactiveWindowSizeMs, activeRequestTolerance,
-           requestsInWindow, lonelyWindowSizeMs,
+           requestsInWindow, lonelyWindowPaddingMs,
+           longTaskAbsoluteThreshold} = kwargs;
+
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    const longTasksUntilNetFI = mainThreadTasks.filter(t =>
+        t.duration >= 50 &&
+        t.end >= searchBegin &&
+        t.start <= forwardNetworkFI
+    );
+
+    if (longTasksUntilNetFI.length === 0) return searchBegin;
+
+    let i = longTasksUntilNetFI.length - 1;
+    while(i >= 0) {
+      // Stop if current task is too long
+      if (longTasksUntilNetFI[i].duration > longTaskAbsoluteThreshold) break;
+      // Stop if current task has another long task nearby
+      if (!isLonely(longTasksUntilNetFI, i, lonelyWindowPaddingMs)) break;
+      i--;
+    }
+
+    return i < 0 ? searchBegin : longTasksUntilNetFI[i].end;
+  }
+
+  function getFINetRevLonelyWindow(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, lonelyWindowSizeMs, lonelyWindowPaddingMs,
            longTaskAbsoluteThreshold} = kwargs;
 
     const forwardNetworkFI = getFIForwardNetwork(kwargs);
@@ -773,7 +802,7 @@ tr.exportTo('tr.metrics.sh', function() {
       // Stop if current task is too long
       if (longTasksUntilNetFI[i].duration > longTaskAbsoluteThreshold) break;
       // Stop if current task another long task nearby
-      if (!isLonely(longTasksUntilNetFI, i, lonelyWindowSizeMs)) break;
+      if (!canBeEnvelopedInLonelyWindow(longTasksUntilNetFI, i, lonelyWindowPaddingMs)) break;
       i--;
     }
 
@@ -1181,7 +1210,22 @@ tr.exportTo('tr.metrics.sh', function() {
             interactiveWindowSizeMs: 5000,
             requestsInWindow: requestsInWindow,
             activeRequestTolerance: 2,
-            lonelyWindowSizeMs: 2000,
+            lonelyWindowPaddingMs: 2000,
+            longTaskAbsoluteThreshold: 250
+          })
+        );
+
+        addWithDiagnostics(
+          'firstInteractiveNetRevLonelyWindow',
+          getFINetRevLonelyWindow({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            interactiveWindowSizeMs: 5000,
+            requestsInWindow: requestsInWindow,
+            activeRequestTolerance: 2,
+            lonelyWindowPaddingMs: 5000,
+            lonelyWindowSizeMs: 250,
             longTaskAbsoluteThreshold: 250
           })
         );
