@@ -26,6 +26,19 @@ tr.exportTo('tr.metrics.sh', function() {
   var RelatedEventSet = tr.v.d.RelatedEventSet;
   // Used to counter floating point errors
   const epsilon = 0.1;
+  const CONSOLE_ENABLED = false;
+
+  // Wrappers around console so we can easily enable/disable console.
+  function consoleWarn(msg) {
+    if (!CONSOLE_ENABLED) return;
+    console.warn(msg);
+  }
+
+  function consoleLog(msg) {
+    if (!CONSOLE_ENABLED) return;
+    console.log(msg);
+  }
+
 
   // TODO(ksakamoto): This should be a method of tr.model.Event or one of its
   // subclasses.
@@ -135,7 +148,6 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function findFirstMeaningfulPaintCandidates(rendererHelper) {
-
     var candidatesForFrameId = {};
     for (var ev of rendererHelper.process.getDescendantEvents()) {
       if (!hasCategoryAndName(ev, 'loading', 'firstMeaningfulPaintCandidate')) {
@@ -151,6 +163,27 @@ tr.exportTo('tr.metrics.sh', function() {
       list.push(ev);
     }
     return candidatesForFrameId;
+  }
+
+  function getDCLTimestampsByFrame(rendererHelper) {
+    const dclTimestampsByFrame = new Map();
+    for (const ev of rendererHelper.process.getDescendantEvents()) {
+      if (!hasCategoryAndName(ev,
+          'blink.user_timing', 'domContentLoadedEventEnd')) {
+        continue;
+      }
+
+      if (rendererHelper.isTelemetryInternalEvent(ev)) continue;
+
+      var frameIdRef = ev.args['frame'];
+      if (frameIdRef === undefined) continue;
+      if (!dclTimestampsByFrame.has(frameIdRef)) {
+        dclTimestampsByFrame.set(frameIdRef, []); 
+      }
+      const dclEvents = dclTimestampsByFrame.get(frameIdRef);
+      dclEvents.push(ev.start);
+    }
+    return dclTimestampsByFrame;
   }
 
   var URL_BLACKLIST = [
@@ -468,11 +501,13 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function getFISimpleForwardSearch(kwargs) {
-    const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, isLongTaskFn, dcl} = kwargs;
     const longTaskThreshold = kwargs.longTaskThreshold || 50;
+    const isLongTask = isLongTaskFn || (task => task.duration > 50);
 
     const longTasksInWindow = mainThreadTasks.filter(task =>
-        task.duration >= longTaskThreshold &&
+        isLongTask(task, searchBegin) &&
         searchBegin <= task.end &&
         task.start <= windowEnd);
 
@@ -491,49 +526,12 @@ tr.exportTo('tr.metrics.sh', function() {
     return null;
   }
 
-  // function getSimpleQuietRanges(kwargs) {
-  //   const {longTasks, windowEnd, quietWindowLength, durationThreshold} = kwargs;
-  //   for (let i = 0; i < longTasks.length; i++) {
-  //     const currTask = longTasks[i];
-  //     const nextTask = longTas
-  //   }
-  // }
-
-  // function getFILayeredForwardSearch(kwargs) {
-  //   const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
-
-  //   const longTaskThreshold = kwargs.longTaskThreshold || 50;
-  //   const longTasksInWindow = mainThreadTasks.filter(task =>
-  //                                                    task.duration >= longTaskThreshold &&
-  //                                                    searchBegin <= task.end &&
-  //                                                    task.start <= windowEnd);
-
-  //   const getSimpleQuietRanges({
-  //     longTasks: longTasksInWindow,
-  //     windowEnd: windowEnd,
-  //     quietWindowLength: 1000,
-  //     durationThreshold: 16,
-  //   });
-
-  //   const reallyQuietFI = getFISimpleForwardSearch({
-  //     windowEnd,
-  //     mainThreadTasks,
-  //     searchBegin: simpleFI,
-  //     interactiveWindowSizeMs: 1000
-  //   })
-  //   for (const task of longTasksInWindow) {
-  //     if ((task.start - quietWindowStart) > interactiveWindowSizeMs) {
-  //       return quietWindowStart;
-  //     }
-  //     quietWindowStart = task.end;
-  //   }
-
-  //   if ((windowEnd - quietWindowStart) > interactiveWindowSizeMs) {
-  //     return quietWindowStart;
-  //   }
-
-  //   return null;
-  // }
+  function getFISimpleForwardSearchDCLBounded(kwargs) {
+    const {dcl} = kwargs;
+    const simpleFI = getFISimpleForwardSearch(kwargs);
+    if (!dcl) return simpleFI;
+    return Math.max(dcl, simpleFI);
+  }
 
   function getFIReverseSearch(kwargs) {
     const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
@@ -783,8 +781,8 @@ tr.exportTo('tr.metrics.sh', function() {
   function getFINetRevLonelyWindow(kwargs) {
     const {searchBegin, windowEnd, mainThreadTasks,
            interactiveWindowSizeMs, activeRequestTolerance,
-           requestsInWindow, lonelyWindowSizeMs, lonelyWindowPaddingMs,
-           longTaskAbsoluteThreshold} = kwargs;
+           requestsInWindow, lonelyWindowSizeMs,
+           lonelyWindowPaddingMs, paddingFromSearchBegin} = kwargs;
 
     const forwardNetworkFI = getFIForwardNetwork(kwargs);
     if (forwardNetworkFI == null) return null;
@@ -798,16 +796,70 @@ tr.exportTo('tr.metrics.sh', function() {
     if (longTasksUntilNetFI.length === 0) return searchBegin;
 
     let i = longTasksUntilNetFI.length - 1;
+    let firstInteractive = undefined;
     while(i >= 0) {
-      // Stop if current task is too long
-      if (longTasksUntilNetFI[i].duration > longTaskAbsoluteThreshold) break;
-      // Stop if current task another long task nearby
-      if (!canBeEnvelopedInLonelyWindow(longTasksUntilNetFI, i, lonelyWindowPaddingMs)) break;
-      i--;
+      // If task is longer than our lonely window, clearly there is no window
+      // that will envelop this long task.
+      if (longTasksUntilNetFI[i].duration >= lonelyWindowSizeMs) {
+        const task = longTasksUntilNetFI[i];
+        const taskStart = task.start;
+        const taskEnd = task.end;
+        consoleLog(`Task at [${taskStart}, ${taskEnd}] too big to envelop`);
+        firstInteractive = longTasksUntilNetFI[i].end;
+        break;
+      }
+
+      // Right boundary of lonely window.
+      const lonelyWindowEnd = longTasksUntilNetFI[i].end;
+
+      // Iterate backward to find the first long task before the lonely window.
+      // i--;  // Loop body guarantees one decrement.
+      let firstTaskIndexInWindow = i;
+      let lastTaskIndexBeforeWindow = firstTaskIndexInWindow - 1;
+
+      const envelopCanGrow = lastTaskIndexBeforeWindow => {
+        const taskBeforeWindow = longTasksUntilNetFI[lastTaskIndexBeforeWindow];
+        return (lonelyWindowEnd - taskBeforeWindow.start) < lonelyWindowSizeMs;
+      }
+
+      while (lastTaskIndexBeforeWindow >= 0
+           && envelopCanGrow(lastTaskIndexBeforeWindow)) {
+        firstTaskIndexInWindow -= 1;
+        lastTaskIndexBeforeWindow = firstTaskIndexInWindow - 1;
+      }
+
+      // Make lonely window should be as tight as possible, so it starts at the
+      // beginning of the first long task in the window.
+      const lonelyWindowStart = longTasksUntilNetFI[firstTaskIndexInWindow].start;
+
+      // Last point before the start of lonely window when the main thread had a
+      // long task. If there is no such long task, use searchBegin.
+      const previousBusyTimestamp = lastTaskIndexBeforeWindow >= 0 ?
+            longTasksUntilNetFI[lastTaskIndexBeforeWindow].end : searchBegin;
+
+      if (lonelyWindowStart - previousBusyTimestamp <= lonelyWindowPaddingMs) {
+        consoleLog(`Window not forgiven: [${lonelyWindowStart},` +
+            ` ${lonelyWindowEnd}] because previous busy timestamp ` +
+            `${previousBusyTimestamp} is too close.`);
+        firstInteractive = lonelyWindowEnd;
+        break;
+      }
+
+      if (lonelyWindowStart - searchBegin <= paddingFromSearchBegin) {
+        consoleLog(`Window not forgiven: [${lonelyWindowStart},` +
+                ` ${lonelyWindowEnd}] because searchBegin ` +
+                   `${searchBegin} is too close.`);
+        firstInteractive = lonelyWindowEnd;
+        break;
+        
+      }
+      consoleLog(`Window forgiven: [${lonelyWindowStart}, ${lonelyWindowEnd}]`);
+      i = lastTaskIndexBeforeWindow;
     }
 
-    return i < 0 ? searchBegin : longTasksUntilNetFI[i].end;
+    return i < 0 ? searchBegin : firstInteractive;
   }
+  
 
   function getNetworkRequests(rendererHelper) {
     return rendererHelper.mainThread.asyncSliceGroup.slices.filter(slice =>
@@ -1020,6 +1072,18 @@ tr.exportTo('tr.metrics.sh', function() {
     return filteredTs[0];
   }
 
+  // This returns undefined if there is none is window.
+  function getFirstInWindow(ts, windowStart, windowEnd) {
+    const filteredTs = ts.filter(t => windowStart <= t && t <= windowEnd);
+    return filteredTs[0];
+  }
+
+  // This returns undefined if there is none is window.
+  function getLastInWindow(ts, windowStart, windowEnd) {
+    const filteredTs = ts.filter(t => windowStart <= t && t <= windowEnd);
+    return filteredTs[filteredTs.length - 1];
+  }
+
   function anyNull(xs) {
     for (const x of xs) if (x === null) return true;
     return false;
@@ -1040,6 +1104,9 @@ tr.exportTo('tr.metrics.sh', function() {
     const fcpTimestampsByFrame =
         getFCPTimestampsByFrame(loadingMetrics.firstContentfulPaintSamples);
 
+    const dclTimestampsByFrame = getDCLTimestampsByFrame(rendererHelper);
+    consoleLog('dclTimestampsByFrame', dclTimestampsByFrame);
+
     const networkRequests = getNetworkRequests(rendererHelper);
     networkRequests.sort((a, b) => a.end - b.end);
 
@@ -1053,10 +1120,10 @@ tr.exportTo('tr.metrics.sh', function() {
 
     var traceEnd = rendererHelper.modelHelper.model.bounds.max;
 
-
     for (var [frame, navStartTimestamps] of navStartTimesByFrame) {
       var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
       var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
+      const dclTimestamps = dclTimestampsByFrame.get(frame) || [];
 
       for (var i = 0; i < navStartTimestamps.length; i++) {
         // Get our window of interest. A window begins at a navigationStart, and
@@ -1070,6 +1137,7 @@ tr.exportTo('tr.metrics.sh', function() {
 
         const fmp = getUniqueInCurrentWindow(fmpTimestamps);
         const fcp = getUniqueInCurrentWindow(fcpTimestamps);
+        const dcl = getLastInWindow(dclTimestamps, windowStart, windowEnd);
         // We need this navigation to at least reach FCP and FMP.
         if (anyNull([fmp, fcp])) continue;
 
@@ -1089,7 +1157,8 @@ tr.exportTo('tr.metrics.sh', function() {
               navigationStart: new tr.v.d.Generic(windowStart),
               tti: new tr.v.d.Generic(sample - windowStart),
               fmp: new tr.v.d.Generic(fmp),
-              fcp: new tr.v.d.Generic(fcp)
+              fcp: new tr.v.d.Generic(fcp),
+              frameId: new tr.v.d.Generic(frame)
             }
           };
           addSamplesToExperimentalHistograms(
@@ -1103,6 +1172,20 @@ tr.exportTo('tr.metrics.sh', function() {
               mainThreadTasks: mainThreadTasks,
               interactiveWindowSizeMs: 5000
             }));
+
+        addWithDiagnostics('firstInteractive-FMP-Proportional',
+                           getFISimpleForwardSearchDCLBounded({
+                             searchBegin: fmp,
+                             windowEnd: windowEnd,
+                             mainThreadTasks: mainThreadTasks,
+                             interactiveWindowSizeMs: 5000,
+                             isLongTaskFn: (task, searchBegin) => {
+                               const timeSinceSearchBegin = task.start - fmp;
+                               return task.duration
+                                   > Math.max(50, timeSinceSearchBegin / 1000 * 10);
+                             },
+                             dcl: dcl
+                           }));
 
         for (let windowSize = 1000; windowSize <= 5000; windowSize += 1000) {
           addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize,
@@ -1224,9 +1307,24 @@ tr.exportTo('tr.metrics.sh', function() {
             interactiveWindowSizeMs: 5000,
             requestsInWindow: requestsInWindow,
             activeRequestTolerance: 2,
-            lonelyWindowPaddingMs: 5000,
+            lonelyWindowPaddingMs: 1000,
             lonelyWindowSizeMs: 250,
-            longTaskAbsoluteThreshold: 250
+            paddingFromSearchBegin: 5000
+          })
+        );
+
+        addWithDiagnostics(
+          'firstInteractiveProportionalLeniency',
+          getFINetRevLonelyWindow({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            interactiveWindowSizeMs: 5000,
+            requestsInWindow: requestsInWindow,
+            activeRequestTolerance: 2,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000
           })
         );
       }
