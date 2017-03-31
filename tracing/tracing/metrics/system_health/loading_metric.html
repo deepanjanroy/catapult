@@ -526,11 +526,9 @@ tr.exportTo('tr.metrics.sh', function() {
     return null;
   }
 
-  function getFISimpleForwardSearchDCLBounded(kwargs) {
-    const {dcl} = kwargs;
-    const simpleFI = getFISimpleForwardSearch(kwargs);
-    if (!dcl) return simpleFI;
-    return Math.max(dcl, simpleFI);
+  function lowerBoundAtDCL(dcl, originalFirstInteractive) {
+    if (!dcl) return originalFirstInteractive;
+    return Math.max(dcl, originalFirstInteractive);
   }
 
   function getFIReverseSearch(kwargs) {
@@ -1063,7 +1061,7 @@ tr.exportTo('tr.metrics.sh', function() {
   function getUniqueInWindow(ts, windowStart, windowEnd) {
     const filteredTs = ts.filter(t => windowStart <= t && t < windowEnd);
 
-    // We make sure we have only one ts (which is usually FMP/FCP/DCL) in
+    // We make sure we have only one ts (which is usually FMP/FCP) in
     // our window. If we find more than one, this is probably a bug and
     // it's best to fail loudly and figure out the underlying issue.
     if (filteredTs.length > 1) throw Error("More than one");
@@ -1166,26 +1164,25 @@ tr.exportTo('tr.metrics.sh', function() {
         }
 
         addWithDiagnostics('firstInteractive-FMP',
-            getFISimpleForwardSearch({
+            lowerBoundAtDCL(dcl, getFISimpleForwardSearch({
               searchBegin: fmp,
               windowEnd: windowEnd,
               mainThreadTasks: mainThreadTasks,
               interactiveWindowSizeMs: 5000
-            }));
+            })));
 
         addWithDiagnostics('firstInteractive-FMP-Proportional',
-                           getFISimpleForwardSearchDCLBounded({
-                             searchBegin: fmp,
-                             windowEnd: windowEnd,
-                             mainThreadTasks: mainThreadTasks,
-                             interactiveWindowSizeMs: 5000,
-                             isLongTaskFn: (task, searchBegin) => {
-                               const timeSinceSearchBegin = task.start - fmp;
-                               return task.duration
-                                   > Math.max(50, timeSinceSearchBegin / 1000 * 10);
-                             },
-                             dcl: dcl
-                           }));
+            lowerBoundAtDCL(dcl, getFISimpleForwardSearch({
+                searchBegin: fmp,
+                windowEnd: windowEnd,
+                mainThreadTasks: mainThreadTasks,
+                interactiveWindowSizeMs: 5000,
+                isLongTaskFn: (task, searchBegin) => {
+                const timeSinceSearchBegin = task.start - fmp;
+                return task.duration
+                    > Math.max(50, timeSinceSearchBegin / 1000 * 10);
+                }
+            })));
 
         for (let windowSize = 1000; windowSize <= 5000; windowSize += 1000) {
           addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize,
@@ -1388,7 +1385,11 @@ tr.exportTo('tr.metrics.sh', function() {
     values.addHistogram(firstMeaningfulPaintHistogram);
     values.addHistogram(firstInteractiveHistogram);
 
-    addExperimentalHistogramsToValues(values, experimentalHistograms);
+    try {
+      addExperimentalHistogramsToValues(values, experimentalHistograms);
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   tr.metrics.MetricRegistry.register(loadingMetric);
