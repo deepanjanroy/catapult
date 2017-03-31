@@ -1335,57 +1335,57 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function loadingMetric(values, model) {
-    var firstContentfulPaintHistogram = createHistogram(
+    try {
+      var firstContentfulPaintHistogram = createHistogram(
         'timeToFirstContentfulPaint');
-    firstContentfulPaintHistogram.description =
+      firstContentfulPaintHistogram.description =
         'time to first contentful paint';
-    var onLoadHistogram = createHistogram('timeToOnload');
-    onLoadHistogram.description = 'time to onload. ' +
+      var onLoadHistogram = createHistogram('timeToOnload');
+      onLoadHistogram.description = 'time to onload. ' +
         'This is temporary metric used for PCv1/v2 sanity checking';
-    var firstMeaningfulPaintHistogram = createHistogram(
+      var firstMeaningfulPaintHistogram = createHistogram(
         'timeToFirstMeaningfulPaint');
-    firstMeaningfulPaintHistogram.description =
+      firstMeaningfulPaintHistogram.description =
         'time to first meaningful paint';
-    var firstMeaningfulPaintCpuTimeHistogram = createHistogram(
+      var firstMeaningfulPaintCpuTimeHistogram = createHistogram(
         'cpuTimeToFirstMeaningfulPaint');
-    firstMeaningfulPaintCpuTimeHistogram.description =
+      firstMeaningfulPaintCpuTimeHistogram.description =
         'CPU time to first meaningful paint';
-    var firstInteractiveHistogram = createHistogram('timeToFirstInteractive');
-    firstInteractiveHistogram.description = 'time to first interactive';
+      var firstInteractiveHistogram = createHistogram('timeToFirstInteractive');
+      firstInteractiveHistogram.description = 'time to first interactive';
 
-    var chromeHelper = model.getOrCreateHelper(
+      var chromeHelper = model.getOrCreateHelper(
         tr.model.helpers.ChromeModelHelper);
 
-    const experimentalHistograms = new Map();
+      const experimentalHistograms = new Map();
 
-    for (var pid in chromeHelper.rendererHelpers) {
-      var rendererHelper = chromeHelper.rendererHelpers[pid];
-      if (rendererHelper.isChromeTracingUI) continue;
+      for (var pid in chromeHelper.rendererHelpers) {
+        var rendererHelper = chromeHelper.rendererHelpers[pid];
+        if (rendererHelper.isChromeTracingUI) continue;
 
-      var rendererLoadingMetrics = collectLoadingMetricsForRenderer(rendererHelper);
-      var {firstContentfulPaintSamples, onLoadSamples,
-           firstMeaningfulPaintSamples, firstMeaningfulPaintCpuTimeSamples,
-           firstInteractiveSamples} = rendererLoadingMetrics;
+        var rendererLoadingMetrics = collectLoadingMetricsForRenderer(rendererHelper);
+        var {firstContentfulPaintSamples, onLoadSamples,
+             firstMeaningfulPaintSamples, firstMeaningfulPaintCpuTimeSamples,
+             firstInteractiveSamples} = rendererLoadingMetrics;
 
-      addSamplesToHistogram(firstContentfulPaintSamples,
-          firstContentfulPaintHistogram);
-      addSamplesToHistogram(onLoadSamples, onLoadHistogram);
-      addSamplesToHistogram(firstMeaningfulPaintSamples,
-          firstMeaningfulPaintHistogram);
-      addSamplesToHistogram(firstMeaningfulPaintCpuTimeSamples,
-          firstMeaningfulPaintCpuTimeHistogram);
-      addSamplesToHistogram(firstInteractiveSamples,
-          firstInteractiveHistogram);
-      addExperimentalFirstInteractiveHistograms(experimentalHistograms, rendererLoadingMetrics, rendererHelper);
-    }
+        addSamplesToHistogram(firstContentfulPaintSamples,
+                              firstContentfulPaintHistogram);
+        addSamplesToHistogram(onLoadSamples, onLoadHistogram);
+        addSamplesToHistogram(firstMeaningfulPaintSamples,
+                              firstMeaningfulPaintHistogram);
+        addSamplesToHistogram(firstMeaningfulPaintCpuTimeSamples,
+                              firstMeaningfulPaintCpuTimeHistogram);
+        addSamplesToHistogram(firstInteractiveSamples,
+                              firstInteractiveHistogram);
+        addExperimentalFirstInteractiveHistograms(experimentalHistograms, rendererLoadingMetrics, rendererHelper);
+      }
 
 
-    values.addHistogram(firstContentfulPaintHistogram);
-    values.addHistogram(onLoadHistogram);
-    values.addHistogram(firstMeaningfulPaintHistogram);
-    values.addHistogram(firstInteractiveHistogram);
+      values.addHistogram(firstContentfulPaintHistogram);
+      values.addHistogram(onLoadHistogram);
+      values.addHistogram(firstMeaningfulPaintHistogram);
+      values.addHistogram(firstInteractiveHistogram);
 
-    try {
       addExperimentalHistogramsToValues(values, experimentalHistograms);
     } catch (e) {
       console.error(e);

@@ -298,7 +298,7 @@ tr.exportTo('tr.e.chrome', function() {
      *
      */
     slideBackwards(t) {
-      this.range_ = tr.b.Range.fromExplicitRange(t, t + this.windowSize_);
+      this.range_ = tr.b.math.Range.fromExplicitRange(t, t + this.windowSize_);
 
       if (this.firstTaskIndex_ - 1 >= 0 &&
           this.sortedTasks_[this.firstTaskIndex_ - 1].end > t) {
