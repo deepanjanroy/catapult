@@ -13,7 +13,7 @@ found in the LICENSE file.
 <link rel="import" href="/tracing/model/helpers/chrome_model_helper.html">
 <link rel="import" href="/tracing/model/timed_event.html">
 <link rel="import" href="/tracing/value/histogram.html">
-<link rel="import" href="/tracing/extras/chrome/estimated_input_latency.html">
+<!-- <link rel="import" href="/tracing/extras/chrome/estimated_input_latency.html"> -->
 
 <script>
 'use strict';
@@ -494,7 +494,7 @@ tr.exportTo('tr.metrics.sh', function() {
     return navStartEvents;
   }
 
-  // This actually ends up sorted the original array despite trying to pretend
+  // This actually ends up sorting the original array despite trying to pretend
   // otherwise. Do not use if you want to preserve the order of the orginal array.
   function numSorted(numericArray) {
     return numericArray.sort((a, b) => a - b);
@@ -502,9 +502,11 @@ tr.exportTo('tr.metrics.sh', function() {
 
   function getFISimpleForwardSearch(kwargs) {
     const {searchBegin, windowEnd, mainThreadTasks,
-           interactiveWindowSizeMs, isLongTaskFn, dcl} = kwargs;
+           interactiveWindowSizeMs, isLongTaskFn, windowIsQuietFn} = kwargs;
     const longTaskThreshold = kwargs.longTaskThreshold || 50;
     const isLongTask = isLongTaskFn || (task => task.duration > 50);
+    const windowIsQuiet = windowIsQuietFn
+        || (windowSize => windowSize > interactiveWindowSizeMs);
 
     const longTasksInWindow = mainThreadTasks.filter(task =>
         isLongTask(task, searchBegin) &&
@@ -513,13 +515,13 @@ tr.exportTo('tr.metrics.sh', function() {
 
     let quietWindowStart = searchBegin;
     for (const task of longTasksInWindow) {
-      if ((task.start - quietWindowStart) > interactiveWindowSizeMs) {
+      if (windowIsQuiet(quietWindowStart, task.start, searchBegin)) {
         return quietWindowStart;
       }
       quietWindowStart = task.end;
     }
 
-    if ((windowEnd - quietWindowStart) > interactiveWindowSizeMs) {
+    if (windowIsQuiet(quietWindowStart, windowEnd, searchBegin)) {
       return quietWindowStart;
     }
 
@@ -647,6 +649,10 @@ tr.exportTo('tr.metrics.sh', function() {
     return refinedFI;
   }
 
+  /* Commenting this out for now. Uncomment estimated_queuing_time import if
+   * you're uncommenting this.
+
+
   // This is the one where we search backwards from network TTI, but instead of
   // strictly looking for long tasks, we look for windows with high EQT.
   function getFIRevFromNetFIHighEqtWindow(kwargs) {
@@ -700,6 +706,8 @@ tr.exportTo('tr.metrics.sh', function() {
 
     return firstInteractive;
   }
+
+  */
 
   function getFIForwardSlideInHighEQTWindow(kwargs) {
     const {searchBegin, windowEnd, mainThreadTasks,
@@ -1173,15 +1181,40 @@ tr.exportTo('tr.metrics.sh', function() {
 
         addWithDiagnostics('firstInteractive-FMP-Proportional',
             lowerBoundAtDCL(dcl, getFISimpleForwardSearch({
-                searchBegin: fmp,
-                windowEnd: windowEnd,
-                mainThreadTasks: mainThreadTasks,
-                interactiveWindowSizeMs: 5000,
-                isLongTaskFn: (task, searchBegin) => {
-                const timeSinceSearchBegin = task.start - fmp;
-                return task.duration
-                    > Math.max(50, timeSinceSearchBegin / 1000 * 10);
-                }
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000,
+              // isLongTaskFn: (task, searchBegin) => {
+              //   const timeSinceSearchBegin = task.start - searchBegin;
+              //   return task.duration
+              //     > Math.max(50, timeSinceSearchBegin / 1000 * 10);
+              // },
+              windowIsQuietFn: (windowStart, windowEnd, searchBegin) => {
+                const timeSinceSearchBegin = windowStart - searchBegin;
+
+                // Required window sizes at t = 0, 15, and infinity
+                const reqSizeAt0 = 5000;
+                const reqSizeAtInfinity = 1000;
+                const reqSizeAt15 = 3000;
+                const t  = windowStart;
+
+                // We solve for
+                // reqSize = a * e ^ (b * t) + c
+
+                // Assuming b is negative, use t -> infinity.
+                const c = reqSizeAtInfinity;
+
+                // Use t = 0
+                const a = reqSizeAt0 - c;
+
+
+                // We then obtain this plugging in t = 15 
+                const b = 1 / 15 * Math.log((reqSizeAt15 - c) / a);
+
+                const reqSize = a * Math.exp(b * t) + c
+                return (windowEnd - windowStart) > reqSize;
+              }
             })));
 
         for (let windowSize = 1000; windowSize <= 5000; windowSize += 1000) {
@@ -1266,20 +1299,20 @@ tr.exportTo('tr.metrics.sh', function() {
         //   }
         // }
 
-        addWithDiagnostics(
-          'firstInteractiveForwardSlideInHighEQTWindow',
-          getFIForwardSlideInHighEQTWindow({
-            searchBegin: fmp,
-            windowEnd: windowEnd,
-            mainThreadTasks: mainThreadTasks,
-            interactiveWindowSizeMs: 5000,
-            requestsInWindow: requestsInWindow,
-            activeRequestTolerance: 2,
-            // These valued looked good enough in brute force search
-            eqtWindowSize: 350,
-            eqtThreshold: 12
-          })
-        );
+        // addWithDiagnostics(
+        //   'firstInteractiveForwardSlideInHighEQTWindow',
+        //   getFIForwardSlideInHighEQTWindow({
+        //     searchBegin: fmp,
+        //     windowEnd: windowEnd,
+        //     mainThreadTasks: mainThreadTasks,
+        //     interactiveWindowSizeMs: 5000,
+        //     requestsInWindow: requestsInWindow,
+        //     activeRequestTolerance: 2,
+        //     // These valued looked good enough in brute force search
+        //     eqtWindowSize: 350,
+        //     eqtThreshold: 12
+        //   })
+        // );
 
         addWithDiagnostics(
           'firstInteractiveNetRevLonelyTask',
