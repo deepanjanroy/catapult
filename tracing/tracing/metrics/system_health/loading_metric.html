@@ -29,14 +29,14 @@ tr.exportTo('tr.metrics.sh', function() {
   const CONSOLE_ENABLED = false;
 
   // Wrappers around console so we can easily enable/disable console.
-  function consoleWarn(msg) {
+  function consoleWarn() {
     if (!CONSOLE_ENABLED) return;
-    console.warn(msg);
+    console.warn(...arguments);
   }
 
-  function consoleLog(msg) {
+  function consoleLog() {
     if (!CONSOLE_ENABLED) return;
-    console.log(msg);
+    console.log(...arguments);
   }
 
 
@@ -506,7 +506,8 @@ tr.exportTo('tr.metrics.sh', function() {
     const longTaskThreshold = kwargs.longTaskThreshold || 50;
     const isLongTask = isLongTaskFn || (task => task.duration > 50);
     const windowIsQuiet = windowIsQuietFn
-        || (windowSize => windowSize > interactiveWindowSizeMs);
+        || ((windowStart, windowEnd, searchBegin) =>
+              (windowEnd - windowStart) > interactiveWindowSizeMs);
 
     const longTasksInWindow = mainThreadTasks.filter(task =>
         isLongTask(task, searchBegin) &&
@@ -528,9 +529,11 @@ tr.exportTo('tr.metrics.sh', function() {
     return null;
   }
 
-  function lowerBoundAtDCL(dcl, originalFirstInteractive) {
-    if (!dcl) return originalFirstInteractive;
-    return Math.max(dcl, originalFirstInteractive);
+  function lowerBoundAtTimestamp(ts, originalFirstInteractive, fmp) {
+    console.log('lower bound', ts);
+    console.log('originalFirstInteractive', originalFirstInteractive);
+    if (!ts) return originalFirstInteractive;
+    return Math.max(ts, originalFirstInteractive);
   }
 
   function getFIReverseSearch(kwargs) {
@@ -1126,12 +1129,12 @@ tr.exportTo('tr.metrics.sh', function() {
 
     var traceEnd = rendererHelper.modelHelper.model.bounds.max;
 
-    for (var [frame, navStartTimestamps] of navStartTimesByFrame) {
-      var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
-      var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
+    for (const [frame, navStartTimestamps] of navStartTimesByFrame) {
+      const fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
+      const fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
       const dclTimestamps = dclTimestampsByFrame.get(frame) || [];
 
-      for (var i = 0; i < navStartTimestamps.length; i++) {
+      for (let i = 0; i < navStartTimestamps.length; i++) {
         // Get our window of interest. A window begins at a navigationStart, and
         // ends either at the next navigationStart, and when we reach end of
         // tracing.
@@ -1143,9 +1146,21 @@ tr.exportTo('tr.metrics.sh', function() {
 
         const fmp = getUniqueInCurrentWindow(fmpTimestamps);
         const fcp = getUniqueInCurrentWindow(fcpTimestamps);
-        const dcl = getLastInWindow(dclTimestamps, windowStart, windowEnd);
-        // We need this navigation to at least reach FCP and FMP.
         if (anyNull([fmp, fcp])) continue;
+        // We look for DCL in the [fcp, windowEnd] range, because sometimes
+        // there are strange DCL events firing right after navigationStart that
+        // is really not the real DCL. Maybe those DCL events come from
+        // redirects?
+        const dclEventsOfInterest = dclTimestamps.filter(ts => (fcp <= ts && ts <= windowEnd));
+        const firstInteractiveLowerBound = dclEventsOfInterest.length === 0
+            ? fcp
+            // There really should be a single DCL in [fcp, windowEnd] range.
+            : getUniqueInCurrentWindow(dclEventsOfInterest);
+
+        console.log("Nav start", navStartTimestamps[i]);
+        console.log("fcp", fcp);
+        console.log("dcl timestamps in window", dclTimestamps.filter(ts => windowStart <= ts && ts <= windowEnd));
+        // We need this navigation to at least reach FCP and FMP.
 
         // All metric calculations should be restricted to objects in the
         // current window.
@@ -1172,59 +1187,82 @@ tr.exportTo('tr.metrics.sh', function() {
         }
 
         addWithDiagnostics('firstInteractive-FMP',
-            lowerBoundAtDCL(dcl, getFISimpleForwardSearch({
+            getFISimpleForwardSearch({
               searchBegin: fmp,
               windowEnd: windowEnd,
               mainThreadTasks: mainThreadTasks,
               interactiveWindowSizeMs: 5000
-            })));
+            }));
+
+        addWithDiagnostics('firstInteractive-MaxFmpDcl',
+            lowerBoundAtTimestamp(firstInteractiveLowerBound,
+                getFISimpleForwardSearch({
+                    searchBegin: fmp,
+                    windowEnd: windowEnd,
+                    mainThreadTasks: mainThreadTasks,
+                    interactiveWindowSizeMs: 5000
+                  })));
 
         addWithDiagnostics('firstInteractive-FMP-Proportional',
-            lowerBoundAtDCL(dcl, getFISimpleForwardSearch({
-              searchBegin: fmp,
-              windowEnd: windowEnd,
-              mainThreadTasks: mainThreadTasks,
-              interactiveWindowSizeMs: 5000,
-              // isLongTaskFn: (task, searchBegin) => {
-              //   const timeSinceSearchBegin = task.start - searchBegin;
-              //   return task.duration
-              //     > Math.max(50, timeSinceSearchBegin / 1000 * 10);
-              // },
-              windowIsQuietFn: (windowStart, windowEnd, searchBegin) => {
-                const timeSinceSearchBegin = windowStart - searchBegin;
+            lowerBoundAtTimestamp(firstInteractiveLowerBound,
+                getFISimpleForwardSearch({
+                  searchBegin: fmp,
+                  windowEnd: windowEnd,
+                  mainThreadTasks: mainThreadTasks,
+                  interactiveWindowSizeMs: 5000,
+                  // isLongTaskFn: (task, searchBegin) => {
+                  //   const timeSinceSearchBegin = task.start - searchBegin;
+                  //   return task.duration
+                  //     > Math.max(50, timeSinceSearchBegin / 1000 * 10);
+                  // },
+                  windowIsQuietFn: (windowStart, windowEnd, searchBegin) => {
+                    const timeSinceSearchBegin = windowStart - searchBegin;
 
-                // Required window sizes at t = 0, 15, and infinity
-                const reqSizeAt0 = 5000;
-                const reqSizeAtInfinity = 1000;
-                const reqSizeAt15 = 3000;
-                const t  = windowStart;
+                    // Required window sizes at t = 0, 15, and infinity
+                    const reqSizeAt0 = 5000;
+                    const reqSizeAtInfinity = 1000;
+                    const reqSizeAt15 = 3000;
+                    const t  = windowStart - searchBegin;
 
-                // We solve for
-                // reqSize = a * e ^ (b * t) + c
+                    // We solve for
+                    // reqSize = a * e ^ (b * t) + c
 
-                // Assuming b is negative, use t -> infinity.
-                const c = reqSizeAtInfinity;
+                    // Assuming b is negative, use t -> infinity.
+                    const c = reqSizeAtInfinity;
 
-                // Use t = 0
-                const a = reqSizeAt0 - c;
+                    // Use t = 0ms
+                    const a = reqSizeAt0 - c;
 
 
-                // We then obtain this plugging in t = 15 
-                const b = 1 / 15 * Math.log((reqSizeAt15 - c) / a);
+                    // We then obtain this plugging in t = 15000ms
+                    const b = 1 / 15000 * Math.log((reqSizeAt15 - c) / a);
 
-                const reqSize = a * Math.exp(b * t) + c
-                return (windowEnd - windowStart) > reqSize;
-              }
+                    const reqSize = a * Math.exp(b * t) + c
+                    // console.log("windowStart", windowStart);
+                    // console.log('windowEnd', windowEnd);
+                    // console.log('searchBegin', searchBegin);
+                    // console.log('reqSize', reqSize);
+
+                    return (windowEnd - windowStart) > reqSize;
+                  }
             })));
 
         for (let windowSize = 1000; windowSize <= 5000; windowSize += 1000) {
+          addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize + '-DCL',
+              lowerBoundAtTimestamp(firstInteractiveLowerBound,
+                  getFISimpleForwardSearch({
+                    searchBegin: fmp,
+                    windowEnd: windowEnd,
+                    mainThreadTasks: mainThreadTasks,
+                    interactiveWindowSizeMs: windowSize
+                  })));
           addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize,
-              getFISimpleForwardSearch({
-                searchBegin: fmp,
-                windowEnd: windowEnd,
-                mainThreadTasks: mainThreadTasks,
-                interactiveWindowSizeMs: windowSize
-              }));
+                getFISimpleForwardSearch({
+                  searchBegin: fmp,
+                  windowEnd: windowEnd,
+                  mainThreadTasks: mainThreadTasks,
+                  interactiveWindowSizeMs: windowSize
+                }));
         }
 
         // addWithDiagnostics('firstInteractive-FMP-1s',
