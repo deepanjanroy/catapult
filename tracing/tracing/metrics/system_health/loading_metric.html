@@ -13,6 +13,7 @@ found in the LICENSE file.
 <link rel="import" href="/tracing/model/helpers/chrome_model_helper.html">
 <link rel="import" href="/tracing/model/timed_event.html">
 <link rel="import" href="/tracing/value/histogram.html">
+<link rel="import" href="/tracing/model/model.html">
 <!-- <link rel="import" href="/tracing/extras/chrome/estimated_input_latency.html"> -->
 
 <script>
@@ -530,8 +531,6 @@ tr.exportTo('tr.metrics.sh', function() {
   }
 
   function lowerBoundAtTimestamp(ts, originalFirstInteractive, fmp) {
-    console.log('lower bound', ts);
-    console.log('originalFirstInteractive', originalFirstInteractive);
     if (!ts) return originalFirstInteractive;
     return Math.max(ts, originalFirstInteractive);
   }
@@ -860,7 +859,7 @@ tr.exportTo('tr.metrics.sh', function() {
                    `${searchBegin} is too close.`);
         firstInteractive = lonelyWindowEnd;
         break;
-        
+
       }
       consoleLog(`Window forgiven: [${lonelyWindowStart}, ${lonelyWindowEnd}]`);
       i = lastTaskIndexBeforeWindow;
@@ -942,6 +941,174 @@ tr.exportTo('tr.metrics.sh', function() {
       eqt += (t.duration / windowSize) * (t.duration / 2);
     }
     return eqt;
+  }
+
+  function getMainThreadTopLevelEventDurations(startTime, endTime, mainThread) {
+    // Find durations of all slices in range of interest.
+    // TODO(bckenny): filter for top level slices ourselves?
+    const durations = [];
+    let clippedLength = 0;
+    mainThread.sliceGroup.topLevelSlices.forEach(slice => {
+      // Discard slices outside range.
+
+      if (slice.end <= startTime || slice.start >= endTime) {
+        return;
+      }
+
+      // Clip any at edges of range.
+      let duration = slice.duration;
+      let sliceStart = slice.start;
+      if (sliceStart < startTime) {
+        // Any part of task before window can be discarded.
+        sliceStart = startTime;
+        duration = slice.end - sliceStart;
+      }
+      if (slice.end > endTime) {
+        // Any part of task after window must be clipped but accounted for.
+        clippedLength = duration - (endTime - sliceStart);
+      }
+
+      durations.push(duration);
+    });
+    durations.sort((a, b) => a - b);
+
+    return {
+      durations,
+      clippedLength
+    };
+  }
+
+  /**
+   * Calculate duration at specified percentiles for given population of
+   * durations.
+   * If one of the durations overlaps the end of the window, the full
+   * duration should be in the duration array, but the length not included
+   * within the window should be given as `clippedLength`. For instance, if a
+   * 50ms duration occurs 10ms before the end of the window, `50` should be in
+   * the `durations` array, and `clippedLength` should be set to 40.
+   * @see https://docs.google.com/document/d/1b9slyaB9yho91YTOkAQfpCdULFkZM9LqsipcX3t7He8/preview
+   * @param {!Array<number>} durations Array of durations, sorted in ascending order.
+   * @param {number} totalTime Total time (in ms) of interval containing durations.
+   * @param {!Array<number>} percentiles Array of percentiles of interest, in ascending order.
+   * @param {number=} clippedLength Optional length clipped from a duration overlapping end of window. Default of 0.
+   * @return {!Array<{percentile: number, time: number}>}
+   * @private
+   */
+  function _riskPercentiles(durations, totalTime, percentiles, clippedLength = 0) {
+    const BASE_RESPONSE_LATENCY = 16.0;
+    let busyTime = 0;
+    for (let i = 0; i < durations.length; i++) {
+      busyTime += durations[i];
+    }
+    busyTime -= clippedLength;
+
+    // Start with idle time already complete.
+    let completedTime = totalTime - busyTime;
+    let duration = 0;
+    let cdfTime = completedTime;
+    const results = [];
+
+    let durationIndex = -1;
+    let remainingCount = durations.length + 1;
+    if (clippedLength > 0) {
+      // If there was a clipped duration, one less in count since one hasn't started yet.
+      remainingCount--;
+    }
+
+    // Find percentiles of interest, in order.
+    for (const percentile of percentiles) {
+      // Loop over durations, calculating a CDF value for each until it is above
+      // the target percentile.
+      const percentileTime = percentile * totalTime;
+      while (cdfTime < percentileTime && durationIndex < durations.length - 1) {
+        completedTime += duration;
+        remainingCount -= (duration < 0 ? -1 : 1);
+
+        if (clippedLength > 0 && clippedLength < durations[durationIndex + 1]) {
+          duration = -clippedLength;
+          clippedLength = 0;
+        } else {
+          durationIndex++;
+          duration = durations[durationIndex];
+        }
+
+        // Calculate value of CDF (multiplied by totalTime) for the end of this duration.
+        cdfTime = completedTime + Math.abs(duration) * remainingCount;
+      }
+
+      // Negative results are within idle time (0ms wait by definition), so clamp at zero.
+      results.push({
+        percentile,
+        time: Math.max(0, (percentileTime - completedTime) / remainingCount) + BASE_RESPONSE_LATENCY
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Calculates the maximum queueing time (in ms) of high priority tasks for
+   * selected percentiles within a window of the main thread.
+   * @see https://docs.google.com/document/d/1b9slyaB9yho91YTOkAQfpCdULFkZM9LqsipcX3t7He8/preview
+   * @param {!traceviewer.Model} model
+   * @param {{traceEvents: !Array<!Object>}} trace
+   * @param {number=} startTime Optional start time (in ms) of range of interest. Defaults to trace start.
+   * @param {number=} endTime Optional end time (in ms) of range of interest. Defaults to trace end.
+   * @param {!Array<number>=} percentiles Optional array of percentiles to compute. Defaults to [0.5, 0.75, 0.9, 0.99, 1].
+   * @return {!Array<{percentile: number, time: number}>}
+   */
+  function getRiskToResponsiveness(startTime, endTime, percentiles, mainThread) {
+    // Range of responsiveness we care about. Default to bounds of model.
+    startTime = startTime === undefined ? model.bounds.min : startTime;
+    endTime = endTime === undefined ? model.bounds.max : endTime;
+    const totalTime = endTime - startTime;
+    if (percentiles) {
+      percentiles.sort((a, b) => a - b);
+    } else {
+      percentiles = [0.5, 0.75, 0.9, 0.99, 1];
+    }
+
+    const ret = getMainThreadTopLevelEventDurations(startTime, endTime, mainThread);
+    return _riskPercentiles(ret.durations, totalTime, percentiles,
+                            ret.clippedLength);
+  }
+  // END FROM LIGHTHOUSE
+
+  function getFILighthouse(kwargs) {
+    const {searchBegin, endOfTraceTime, mainThreadTasks, model, mainThread} = kwargs;
+
+    // From lighthouse (https://github.com/GoogleChrome/lighthouse/blob/338b09eb3c4275a1609fd1136b5818a917223137/lighthouse-core/audits/time-to-interactive.js)
+
+    // Find first 500ms window where Est Input Latency is <50ms at the 90% percentile.
+    let startTime = searchBegin
+    let endTime;
+    let currentLatency = Infinity;
+    const percentiles = [0.9]; // [0.75, 0.9, 0.99, 1];
+    const threshold = 50;
+    const foundLatencies = [];
+
+    // When we've found a latency that's good enough, we're good.
+    while (currentLatency > threshold) {
+      // While latency is too high, increment just 50ms and look again.
+      startTime += 50;
+      endTime = startTime + 500;
+      // If there's no more room in the trace to look, we're done.
+      if (endTime > endOfTraceTime) {
+        throw new Error('Entire trace was found to be busy.');
+      }
+      // Get our expected latency for the time window
+      const latencies = getRiskToResponsiveness(startTime, endTime, percentiles, mainThread);
+      const estLatency = latencies[0].time;
+      foundLatencies.push({
+        estLatency: estLatency,
+        startTime: startTime.toFixed(1)
+      });
+
+      // Grab this latency and try the threshold again
+      currentLatency = estLatency;
+    }
+    // The start of our window is our TTI
+    return startTime;
   }
 
   // This is the one where we look at the EQT between two potential
@@ -1146,21 +1313,23 @@ tr.exportTo('tr.metrics.sh', function() {
 
         const fmp = getUniqueInCurrentWindow(fmpTimestamps);
         const fcp = getUniqueInCurrentWindow(fcpTimestamps);
-        if (anyNull([fmp, fcp])) continue;
-        // We look for DCL in the [fcp, windowEnd] range, because sometimes
-        // there are strange DCL events firing right after navigationStart that
-        // is really not the real DCL. Maybe those DCL events come from
-        // redirects?
-        const dclEventsOfInterest = dclTimestamps.filter(ts => (fcp <= ts && ts <= windowEnd));
-        const firstInteractiveLowerBound = dclEventsOfInterest.length === 0
-            ? fcp
-            // There really should be a single DCL in [fcp, windowEnd] range.
-            : getUniqueInCurrentWindow(dclEventsOfInterest);
 
-        console.log("Nav start", navStartTimestamps[i]);
-        console.log("fcp", fcp);
-        console.log("dcl timestamps in window", dclTimestamps.filter(ts => windowStart <= ts && ts <= windowEnd));
-        // We need this navigation to at least reach FCP and FMP.
+        // For some strange reason, there seems is often a spurious DCL event
+        // miliseconds after navigationStart. This may be due to how devtools
+        // handled emulation. For now, hacking around this problem by filtering
+        // out DCL events within 10ms of navigationStart.
+        const filteredDCLEvents =
+            dclTimestamps.filter(
+                ts => (windowStart + 10 <= ts && ts <= windowEnd));
+
+        const dcl = getUniqueInCurrentWindow(filteredDCLEvents);
+
+        // We need this navigation to at least reach FCP, FMP, and DCL.
+        if (anyNull([fmp, fcp, dcl])) continue;
+
+        // This is a convenience variable so it's easy to tweak.
+        const firstInteractiveLowerBound = dcl;
+
 
         // All metric calculations should be restricted to objects in the
         // current window.
@@ -1237,6 +1406,7 @@ tr.exportTo('tr.metrics.sh', function() {
                     // We then obtain this plugging in t = 15000ms
                     const b = 1 / 15000 * Math.log((reqSizeAt15 - c) / a);
 
+
                     const reqSize = a * Math.exp(b * t) + c
                     // console.log("windowStart", windowStart);
                     // console.log('windowEnd', windowEnd);
@@ -1246,6 +1416,15 @@ tr.exportTo('tr.metrics.sh', function() {
                     return (windowEnd - windowStart) > reqSize;
                   }
             })));
+
+        addWithDiagnostics('firstInteractive-Lighthouse',
+            getFILighthouse({
+              searchBegin: firstInteractiveLowerBound,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              model: rendererHelper.modelHelper.model,
+              mainThread: rendererHelper.mainThread,
+            }));
 
         for (let windowSize = 1000; windowSize <= 5000; windowSize += 1000) {
           addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize + '-DCL',
