@@ -179,7 +179,7 @@ tr.exportTo('tr.metrics.sh', function() {
       var frameIdRef = ev.args['frame'];
       if (frameIdRef === undefined) continue;
       if (!dclTimestampsByFrame.has(frameIdRef)) {
-        dclTimestampsByFrame.set(frameIdRef, []); 
+        dclTimestampsByFrame.set(frameIdRef, []);
       }
       const dclEvents = dclTimestampsByFrame.get(frameIdRef);
       dclEvents.push(ev.start);
@@ -859,15 +859,132 @@ tr.exportTo('tr.metrics.sh', function() {
                    `${searchBegin} is too close.`);
         firstInteractive = lonelyWindowEnd;
         break;
-
       }
+
       consoleLog(`Window forgiven: [${lonelyWindowStart}, ${lonelyWindowEnd}]`);
       i = lastTaskIndexBeforeWindow;
     }
 
     return i < 0 ? searchBegin : firstInteractive;
   }
-  
+
+  function getFIEventListeners(kwargs) {
+    const {searchBegin, windowEnd, updateCounters,
+        eventListenerThreshold} = kwargs;
+
+    // If there's a long gap after the last registered event listener, include it.
+    updateCounters.push({ts:windowEnd, listeners:0, synthetic:true})
+
+    // Ignore changes before searchBegin.
+    while(updateCounters[0].ts < searchBegin) {
+      updateCounters.shift();
+    }
+
+    let previousCounter = updateCounters[0];
+    for (let counter of updateCounters.slice(1)) {
+      if (counter.ts - previousCounter.ts > eventListenerThreshold) {
+        return previousCounter.ts;
+      }
+      if (previousCounter.listeners != counter.listeners) {
+        previousCounter = counter;
+      }
+    }
+
+    return null;
+  }
+
+  function getFIProportionalAndLonely(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           windowIsQuiet, lonelyWindowSizeMs,
+           lonelyWindowPaddingMs, paddingFromSearchBegin} = kwargs;
+
+    const longTasksInWindow = mainThreadTasks.filter(t =>
+        t.duration >= 50 &&
+        t.end >= searchBegin &&
+        t.start <= windowEnd
+    );
+
+    const getLonelyIndices = () => {
+      let lonelyIndices = [];
+      let i = 0;
+      while (i < longTasksInWindow.length) {
+        const currTask = longTasksInWindow[i];
+        if (currTask.start < searchBegin + paddingFromSearchBegin) {
+          i++;
+          continue;
+        }
+
+        const quietWindowStart = i === 0 ? searchBegin
+              : longTasksInWindow[i - 1].end;
+        if ((currTask.start - quietWindowStart) < lonelyWindowPaddingMs) {
+          i++;
+          continue;
+        }
+
+        if (currTask.duration > lonelyWindowPaddingMs) {
+          i++;
+          continue;
+        }
+
+        const lonelyWindowStart = currTask.start;
+        let lastTaskIndexInWindow = i;
+
+        const envelopCanGrow = lastTaskIndexInWindow => {
+          if (lastTaskIndexInWindow + 1 === longTasksInWindow.length) {
+            return false;
+          }
+
+          const nextTask = longTasksInWindow[lastTaskIndexInWindow + 1];
+          if (nextTask.end - lonelyWindowStart > lonelyWindowSizeMs) {
+            return false;
+          }
+
+          return true;
+        }
+
+        while (envelopCanGrow(lastTaskIndexInWindow)) {
+          lastTaskIndexInWindow++;
+        }
+
+        const lonelyWindowEnd = longTasksInWindow[lastTaskIndexInWindow].end;
+        const firstTaskIndexBeyondWindow = lastTaskIndexInWindow + 1;
+        const nextEndpoint = firstTaskIndexBeyondWindow === longTasksInWindow.length
+            ? windowEnd : longTasksInWindow[firstTaskIndexBeyondWindow].start;
+        if (nextEndpoint - lonelyWindowEnd > lonelyWindowPaddingMs) {
+          // The tasks inside the envelope are now officially lonely.
+          for (let j = i; j < firstTaskIndexBeyondWindow; j++) {
+            lonelyIndices.push(j);
+          }
+          i = firstTaskIndexBeyondWindow;
+        } else {
+          i++;
+        }
+      }
+      return new Set(lonelyIndices);
+    }
+
+    if (longTasksInWindow.length === 0) return searchBegin;
+
+    // Find task indices that can be excluded.
+    const lonelyIndices = getLonelyIndices();
+    let firstInteractive = undefined;
+    let quietWindowStart = searchBegin;
+    for (let i = 0; i < longTasksInWindow.length; i++) {
+      if (lonelyIndices.has(i)) continue;
+
+      const task = longTasksInWindow[i];
+      if (windowIsQuiet(quietWindowStart, task.start, searchBegin)) {
+        return quietWindowStart;
+      }
+      quietWindowStart = task.end;
+    }
+
+    if (windowIsQuiet(quietWindowStart, windowEnd, searchBegin)) {
+      return quietWindowStart;
+    }
+
+    return null;
+  }
 
   function getNetworkRequests(rendererHelper) {
     return rendererHelper.mainThread.asyncSliceGroup.slices.filter(slice =>
@@ -1286,6 +1403,10 @@ tr.exportTo('tr.metrics.sh', function() {
     const networkRequests = getNetworkRequests(rendererHelper);
     networkRequests.sort((a, b) => a.end - b.end);
 
+    const updateCounters = rendererHelper.mainThread.sliceGroup.slices.
+        filter(x => x.title == "UpdateCounters").
+        map(x => ({ts : x.start, listeners: x.args.data.jsEventListeners}));
+
     const mainThreadTasks = [];
     for (var e of rendererHelper.mainThread.sliceGroup.childEvents()) {
       if (e.title === 'TaskQueueManager::ProcessTaskFromWorkQueue') {
@@ -1372,50 +1493,56 @@ tr.exportTo('tr.metrics.sh', function() {
                     interactiveWindowSizeMs: 5000
                   })));
 
-        addWithDiagnostics('firstInteractive-FMP-Proportional',
-            lowerBoundAtTimestamp(firstInteractiveLowerBound,
-                getFISimpleForwardSearch({
-                  searchBegin: fmp,
-                  windowEnd: windowEnd,
-                  mainThreadTasks: mainThreadTasks,
-                  interactiveWindowSizeMs: 5000,
-                  // isLongTaskFn: (task, searchBegin) => {
-                  //   const timeSinceSearchBegin = task.start - searchBegin;
-                  //   return task.duration
-                  //     > Math.max(50, timeSinceSearchBegin / 1000 * 10);
-                  // },
-                  windowIsQuietFn: (windowStart, windowEnd, searchBegin) => {
-                    const timeSinceSearchBegin = windowStart - searchBegin;
+        const genWindowIsQuietFn = (w0, w15, wInf) => {
+          return (windowStart, windowEnd, searchBegin) => {
+            const timeSinceSearchBegin = windowStart - searchBegin;
 
-                    // Required window sizes at t = 0, 15, and infinity
-                    const reqSizeAt0 = 5000;
-                    const reqSizeAtInfinity = 1000;
-                    const reqSizeAt15 = 3000;
-                    const t  = windowStart - searchBegin;
+            // Required window sizes at t = 0, 15, and infinity
+            const reqSizeAt0 = w0;
+            const reqSizeAt15 = w15;
+            const reqSizeAtInfinity = wInf;
+            const t  = windowStart - searchBegin;
 
-                    // We solve for
-                    // reqSize = a * e ^ (b * t) + c
+            // We solve for
+            // reqSize = a * e ^ (b * t) + c
 
-                    // Assuming b is negative, use t -> infinity.
-                    const c = reqSizeAtInfinity;
+            // Assuming b is negative, use t -> infinity.
+            const c = reqSizeAtInfinity;
 
-                    // Use t = 0ms
-                    const a = reqSizeAt0 - c;
+            // Use t = 0ms
+            const a = reqSizeAt0 - c;
 
 
-                    // We then obtain this plugging in t = 15000ms
-                    const b = 1 / 15000 * Math.log((reqSizeAt15 - c) / a);
+            // We then obtain this plugging in t = 15000ms
+            const b = 1 / 15000 * Math.log((reqSizeAt15 - c) / a);
 
 
-                    const reqSize = a * Math.exp(b * t) + c
-                    // console.log("windowStart", windowStart);
-                    // console.log('windowEnd', windowEnd);
-                    // console.log('searchBegin', searchBegin);
-                    // console.log('reqSize', reqSize);
+            const reqSize = a * Math.exp(b * t) + c
+            // console.log("windowStart", windowStart);
+            // console.log('windowEnd', windowEnd);
+            // console.log('searchBegin', searchBegin);
+            // console.log('reqSize', reqSize);
 
-                    return (windowEnd - windowStart) > reqSize;
-                  }
-            })));
+            return (windowEnd - windowStart) > reqSize;
+          };
+        }
+
+        for (let w15 = 3000; w15 > 1000; w15 -= 250) {
+          addWithDiagnostics('firstInteractive-FMP-Proportional-w15-' + w15,
+              lowerBoundAtTimestamp(firstInteractiveLowerBound,
+                  getFISimpleForwardSearch({
+                    searchBegin: fmp,
+                    windowEnd: windowEnd,
+                    mainThreadTasks: mainThreadTasks,
+                    interactiveWindowSizeMs: 5000,
+                    // isLongTaskFn: (task, searchBegin) => {
+                    //   const timeSinceSearchBegin = task.start - searchBegin;
+                    //   return task.duration
+                    //     > Math.max(50, timeSinceSearchBegin / 1000 * 10);
+                    // },
+                    windowIsQuietFn: genWindowIsQuietFn(5000, w15, 1000)
+                  })));
+        }
 
         addWithDiagnostics('firstInteractive-Lighthouse',
             getFILighthouse({
@@ -1460,6 +1587,14 @@ tr.exportTo('tr.metrics.sh', function() {
         //       mainThreadTasks: mainThreadTasks,
         //       interactiveWindowSizeMs: 5000
         //     }));
+
+        addWithDiagnostics('firstInteractive-EventListeners',
+            getFIEventListeners({
+              searchBegin: dcl,
+              windowEnd: windowEnd,
+              updateCounters: updateCounters,
+              eventListenerThreshold: 500
+            }));
 
         addWithDiagnostics('firstInteractive-FMP-ReverseSearch',
             getFIReverseSearch({
@@ -1533,21 +1668,21 @@ tr.exportTo('tr.metrics.sh', function() {
 
         addWithDiagnostics(
           'firstInteractiveNetRevLonelyTask',
-          getFINetRevLonelyTask({
-            searchBegin: fmp,
-            windowEnd: windowEnd,
-            mainThreadTasks: mainThreadTasks,
-            interactiveWindowSizeMs: 5000,
-            requestsInWindow: requestsInWindow,
-            activeRequestTolerance: 2,
-            lonelyWindowPaddingMs: 2000,
-            longTaskAbsoluteThreshold: 250
-          })
-        );
+          lowerBoundAtTimestamp(firstInteractiveLowerBound,
+              getFINetRevLonelyTask({
+                searchBegin: fmp,
+                windowEnd: windowEnd,
+                mainThreadTasks: mainThreadTasks,
+                interactiveWindowSizeMs: 5000,
+                requestsInWindow: requestsInWindow,
+                activeRequestTolerance: 2,
+                lonelyWindowPaddingMs: 1000,
+                longTaskAbsoluteThreshold: 200
+              })));
 
         addWithDiagnostics(
           'firstInteractiveNetRevLonelyWindow',
-          getFINetRevLonelyWindow({
+          lowerBoundAtTimestamp(dcl, getFINetRevLonelyWindow({
             searchBegin: fmp,
             windowEnd: windowEnd,
             mainThreadTasks: mainThreadTasks,
@@ -1557,23 +1692,69 @@ tr.exportTo('tr.metrics.sh', function() {
             lonelyWindowPaddingMs: 1000,
             lonelyWindowSizeMs: 250,
             paddingFromSearchBegin: 5000
-          })
+          }))
         );
 
+        // for (let w15 = 1250; w15 < 3001; w15 += 250) {
+        //   for (const padding of [1000, 2000]) {
+        //     for (const lws of [150, 200, 250]) {
+        //       for (const psb of [0, 5000]) {
+        //         const m =
+        //           'firstInteractive-FMP-Proportional-w15-' + w15 +
+        //           '-lonely-ws-' + lws + '-padding-' + padding + 'psb-' + psb;
+        //         console.log(m);
+        //         addWithDiagnostics(
+        //           m,
+        //           lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+        //             searchBegin: fmp,
+        //             windowEnd: windowEnd,
+        //             mainThreadTasks: mainThreadTasks,
+        //             lonelyWindowPaddingMs: padding,
+        //             lonelyWindowSizeMs: lws,
+        //             paddingFromSearchBegin: psb,
+        //             windowIsQuiet: genWindowIsQuietFn(5000, w15, 1000)
+        //           }))
+        //         );
+        //       }
+        //     }
+        //   }
+        // }
+
         addWithDiagnostics(
-          'firstInteractiveProportionalLeniency',
-          getFINetRevLonelyWindow({
+          'firstInteractive-FMP-Proportional-w15-3000-lonely-ws-250-padding-1000psb-5000',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
             searchBegin: fmp,
             windowEnd: windowEnd,
             mainThreadTasks: mainThreadTasks,
-            interactiveWindowSizeMs: 5000,
-            requestsInWindow: requestsInWindow,
-            activeRequestTolerance: 2,
             lonelyWindowPaddingMs: 1000,
             lonelyWindowSizeMs: 250,
-            paddingFromSearchBegin: 5000
-          })
-        );
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: genWindowIsQuietFn(5000, 3000, 1000)
+            })));
+
+        addWithDiagnostics(
+          'firstInteractive-FCP-Proportional-w15-3000-lonely-ws-250-padding-1000psb-5000',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+            searchBegin: fcp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: genWindowIsQuietFn(5000, 3000, 1000)
+          })));
+
+        addWithDiagnostics(
+          'firstInteractive-DCL-Proportional-w15-3000-lonely-ws-250-padding-1000psb-5000',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+            searchBegin: Math.max(fcp, dcl),
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: genWindowIsQuietFn(5000, 3000, 1000)
+          })));
       }
     }
   }
