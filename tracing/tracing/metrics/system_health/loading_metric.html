@@ -1755,6 +1755,18 @@ tr.exportTo('tr.metrics.sh', function() {
             paddingFromSearchBegin: 5000,
             windowIsQuiet: genWindowIsQuietFn(5000, 3000, 1000)
           })));
+
+        addWithDiagnostics(
+          'firstInteractive-FMP-ForwardProportional',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: (windowStart, windowEnd) => (windowEnd - windowStart > 5000)
+          })));
       }
     }
   }
