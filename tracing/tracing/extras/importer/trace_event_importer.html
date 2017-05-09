@@ -669,6 +669,9 @@ tr.exportTo('tr.e.importer', function() {
       } else if (event.name === 'TraceConfig') {
         this.model_.metadata.push(
               {name: 'TraceConfig', value: event.args.value});
+      } else if (event.name === 'CustomMarkings') {
+          this.model_.metadata.push(
+              {name: 'CustomMarkings', value: event.args.value});
       } else {
         this.model_.importWarning({
           type: 'metadata_parse_error',

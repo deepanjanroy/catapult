@@ -283,6 +283,47 @@ tr.exportTo('tr.e.chrome', function() {
         this.lastTaskIndex_++;
       }
     }
+
+    get range() {
+        return this.range_;
+    }
+
+    taskIndexInBounds(index) {
+      return index >= 0 && index < this.sortedTasks_.length;
+    }
+
+    /**
+     * Moves the window backward so that the beginning of the window is at t.
+     * @param {number} The time.
+     *
+     */
+    slideBackwards(t) {
+      this.range_ = tr.b.math.Range.fromExplicitRange(t, t + this.windowSize_);
+
+      if (this.firstTaskIndex_ - 1 >= 0 &&
+          this.sortedTasks_[this.firstTaskIndex_ - 1].end > t) {
+        // A new task moved into the window
+        if (this.firstTaskIndex_ < this.lastTaskIndex_) {
+          // The old first task is completely inside the window.
+          // Account for it in innerEQT.
+          this.innerEQT_ = contributionToEQT(this.range_,
+              this.sortedTasks_[this.firstTaskIndex_]);
+        }
+        this.firstTaskIndex_--;
+      }
+
+      if (this.lastTaskIndex_ >= 0 &&
+         this.sortedTasks_[this.lastTaskIndex_].start > t + this.windowSize_) {
+        // The last task moved out of the window
+        this.lastTaskIndex_--;
+        if (this.lastTaskIndex_ > this.firstTaskIndex_) {
+          // The new last task in the window was accounted for in innerEQT. Undo
+          // that.
+          this.innerEQT_ -= contributionToEQT(this.range_,
+              this.sortedTasks_[this.lastTaskIndex_]);
+        }
+      }
+    }
   }
 
   /**
@@ -355,7 +396,8 @@ tr.exportTo('tr.e.chrome', function() {
     getInteractiveTimestamps,
     expectedQueueingTime,
     maxExpectedQueueingTimeInSlidingWindow,
-    weightedExpectedQueueingTime
+    weightedExpectedQueueingTime,
+    SlidingWindow
   };
 });
 </script>

@@ -14,6 +14,8 @@ found in the LICENSE file.
 <link rel="import" href="/tracing/model/helpers/chrome_thread_helper.html">
 <link rel="import" href="/tracing/model/timed_event.html">
 <link rel="import" href="/tracing/value/histogram.html">
+<link rel="import" href="/tracing/model/model.html">
+<!-- <link rel="import" href="/tracing/extras/chrome/estimated_input_latency.html"> -->
 
 <script>
 'use strict';
@@ -23,27 +25,22 @@ tr.exportTo('tr.metrics.sh', function() {
   const INTERACTIVE_WINDOW_SIZE_MS = 5 * 1000;
   const timeDurationInMs_smallerIsBetter =
       tr.b.Unit.byName.timeDurationInMs_smallerIsBetter;
-  const RelatedEventSet = tr.v.d.RelatedEventSet;
+  var RelatedEventSet = tr.v.d.RelatedEventSet;
+  // Used to counter floating point errors
+  const epsilon = 0.1;
+  const CONSOLE_ENABLED = false;
 
-  /**
-   * @param  {!tr.model.Process} process
-   * @param  {!tr.b.math.Range} range
-   * @return {Array.<tr.model.Event>} An array of network events of a process
-   * and that are intersecting a range.
-   */
-  function getNetworkEventsInRange(process, range) {
-    const networkEvents = [];
-    for (const thread of Object.values(process.threads)) {
-      const threadHelper = new tr.model.helpers.ChromeThreadHelper(thread);
-      const events = threadHelper.getNetworkEvents();
-      for (const event of events) {
-        if (range.intersectsExplicitRangeInclusive(event.start, event.end)) {
-          networkEvents.push(event);
-        }
-      }
-    }
-    return networkEvents;
+  // Wrappers around console so we can easily enable/disable console.
+  function consoleWarn() {
+    if (!CONSOLE_ENABLED) return;
+    console.warn(...arguments);
   }
+
+  function consoleLog() {
+    if (!CONSOLE_ENABLED) return;
+    console.log(...arguments);
+  }
+
 
   // TODO(ksakamoto): This should be a method of tr.model.Event or one of its
   // subclasses.
@@ -168,7 +165,28 @@ tr.exportTo('tr.metrics.sh', function() {
     return candidatesForFrameId;
   }
 
-  const URL_BLACKLIST = [
+  function getDCLTimestampsByFrame(rendererHelper) {
+    const dclTimestampsByFrame = new Map();
+    for (const ev of rendererHelper.process.getDescendantEvents()) {
+      if (!hasCategoryAndName(ev,
+          'blink.user_timing', 'domContentLoadedEventEnd')) {
+        continue;
+      }
+
+      if (rendererHelper.isTelemetryInternalEvent(ev)) continue;
+
+      var frameIdRef = ev.args['frame'];
+      if (frameIdRef === undefined) continue;
+      if (!dclTimestampsByFrame.has(frameIdRef)) {
+        dclTimestampsByFrame.set(frameIdRef, []);
+      }
+      const dclEvents = dclTimestampsByFrame.get(frameIdRef);
+      dclEvents.push(ev.start);
+    }
+    return dclTimestampsByFrame;
+  }
+
+  var URL_BLACKLIST = [
     'about:blank',
     // Chrome on Android creates main frames with the below URL for plugins.
     'data:text/html,pluginplaceholderdata',
@@ -201,7 +219,8 @@ tr.exportTo('tr.metrics.sh', function() {
       const timeToEvent = ev.start - navigationStartEvent.start;
       samples.push({
         value: timeToEvent,
-        diagnostics: {url: new tr.v.d.Generic(url)}
+        diagnostics: {url: new tr.v.d.Generic(url), eventTimestamp: new tr.v.d.Generic(ev.start),
+                      frame: new tr.v.d.Generic(frameIdRef)}
       });
     }
     return samples;
@@ -226,15 +245,13 @@ tr.exportTo('tr.metrics.sh', function() {
     samples.push({
       value: timeToFirstMeaningfulPaint,
       diagnostics: {
-        'Breakdown of [navStart, FMP]': breakdownDiagnostic,
-        'Start': new RelatedEventSet(navigationStart),
-        'End': new RelatedEventSet(fmpMarkerEvent),
-        'Navigation infos': new tr.v.d.Generic({
-          url,
-          pid: rendererHelper.pid,
-          start: navigationStart.start,
-          fmp: fmpMarkerEvent.start
-        }),
+          'Breakdown of [navStart, FMP]': breakdownDiagnostic,
+          'Start': new RelatedEventSet(navigationStart),
+          'End': new RelatedEventSet(fmpMarkerEvent),
+          'Navigation infos': new tr.v.d.Generic(
+              {url: url, pid: rendererHelper.pid,
+                start: navigationStart.start, fmp: fmpMarkerEvent.start,
+                frame: frameIdRef}),
       }
     });
     return {firstMeaningfulPaint: fmpMarkerEvent.start, url};
@@ -446,56 +463,1384 @@ tr.exportTo('tr.metrics.sh', function() {
 
   function addSamplesToHistogram(samples, histogram) {
     for (const sample of samples) {
-      histogram.addSample(sample.value, sample.diagnostics);
+      if (sample !== null) {
+        if (typeof(sample) === "number") {
+          histogram.addSample(sample);
+        } else {
+          // Assume sample is of the form {value, diagnostics}
+          histogram.addSample(sample.value, sample.diagnostics);
+        }
+      }
     }
   }
 
-  function loadingMetric(histograms, model) {
-    const firstContentfulPaintHistogram = createHistogram(
-        'timeToFirstContentfulPaint');
-    firstContentfulPaintHistogram.description =
-        'time to first contentful paint';
-    const onLoadHistogram = createHistogram('timeToOnload');
-    onLoadHistogram.description = 'time to onload. ' +
-        'This is temporary metric used for PCv1/v2 sanity checking';
-    const firstMeaningfulPaintHistogram = createHistogram(
-        'timeToFirstMeaningfulPaint');
-    firstMeaningfulPaintHistogram.description =
-        'time to first meaningful paint';
-    const firstMeaningfulPaintCpuTimeHistogram = createHistogram(
-        'cpuTimeToFirstMeaningfulPaint');
-    firstMeaningfulPaintCpuTimeHistogram.description =
-        'CPU time to first meaningful paint';
-    const firstInteractiveHistogram = createHistogram('timeToFirstInteractive');
-    firstInteractiveHistogram.description = 'time to first interactive';
+  function addSamplesToExperimentalHistograms(samples, histogramMap, histogramName) {
+    if (!histogramMap.has(histogramName)) {
+      histogramMap.set(histogramName, createHistogram(histogramName));
+    }
+    const histogram = histogramMap.get(histogramName);
+    addSamplesToHistogram(samples, histogram);
+  }
 
-    const chromeHelper = model.getOrCreateHelper(
-        tr.model.helpers.ChromeModelHelper);
-    for (const pid in chromeHelper.rendererHelpers) {
-      const rendererHelper = chromeHelper.rendererHelpers[pid];
-      if (rendererHelper.isChromeTracingUI) continue;
+  function addRawSamplesToHistogram(rawSamples, histogram) {
+    for (var sample of rawSamples) {
+      histogram.addSample(sample);
+    }
+  }
 
-      const {firstContentfulPaintSamples, onLoadSamples,
-           firstMeaningfulPaintSamples, firstMeaningfulPaintCpuTimeSamples,
-           firstInteractiveSamples} =
-          collectLoadingMetricsForRenderer(rendererHelper);
+  function hasTitleAndCategory(event, title, category) {
+    return event.title === title && event.category &&
+      tr.b.getCategoryParts(event.category).indexOf(category) !== -1;
+  }
 
-      addSamplesToHistogram(firstContentfulPaintSamples,
-          firstContentfulPaintHistogram);
-      addSamplesToHistogram(onLoadSamples, onLoadHistogram);
-      addSamplesToHistogram(firstMeaningfulPaintSamples,
-          firstMeaningfulPaintHistogram);
-      addSamplesToHistogram(firstMeaningfulPaintCpuTimeSamples,
-          firstMeaningfulPaintCpuTimeHistogram);
-      addSamplesToHistogram(firstInteractiveSamples,
-          firstInteractiveHistogram);
+  function getNavStartEvents(rendererHelper) {
+    var navStartEvents = [];
+    for (var e of rendererHelper.mainThread.sliceGroup.childEvents()) {
+      if (hasTitleAndCategory(e, 'navigationStart', 'blink.user_timing')) {
+        navStartEvents.push(e);
+      }
+    }
+    return navStartEvents;
+  }
+
+  // This actually ends up sorting the original array despite trying to pretend
+  // otherwise. Do not use if you want to preserve the order of the orginal array.
+  function numSorted(numericArray) {
+    return numericArray.sort((a, b) => a - b);
+  }
+
+  function getFISimpleForwardSearch(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, isLongTaskFn, windowIsQuietFn} = kwargs;
+    const longTaskThreshold = kwargs.longTaskThreshold || 50;
+    const isLongTask = isLongTaskFn || (task => task.duration > 50);
+    const windowIsQuiet = windowIsQuietFn
+        || ((windowStart, windowEnd, searchBegin) =>
+              (windowEnd - windowStart) > interactiveWindowSizeMs);
+
+    const longTasksInWindow = mainThreadTasks.filter(task =>
+        isLongTask(task, searchBegin) &&
+        searchBegin <= task.end &&
+        task.start <= windowEnd);
+
+    let quietWindowStart = searchBegin;
+    for (const task of longTasksInWindow) {
+      if (windowIsQuiet(quietWindowStart, task.start, searchBegin)) {
+        return quietWindowStart;
+      }
+      quietWindowStart = task.end;
     }
 
-    histograms.addHistogram(firstContentfulPaintHistogram);
-    histograms.addHistogram(onLoadHistogram);
-    histograms.addHistogram(firstMeaningfulPaintHistogram);
-    histograms.addHistogram(firstMeaningfulPaintCpuTimeHistogram);
-    histograms.addHistogram(firstInteractiveHistogram);
+    if (windowIsQuiet(quietWindowStart, windowEnd, searchBegin)) {
+      return quietWindowStart;
+    }
+
+    return null;
+  }
+
+  function lowerBoundAtTimestamp(ts, originalFirstInteractive, fmp) {
+    if (!ts) return originalFirstInteractive;
+    return Math.max(ts, originalFirstInteractive);
+  }
+
+  function getFIReverseSearch(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks, interactiveWindowSizeMs} = kwargs;
+    const longTasksInWindow = mainThreadTasks.filter(task =>
+        task.duration >= 50 &&
+        searchBegin <= task.end &&
+        task.start <= windowEnd);
+
+    const possibleFirstInteractive = longTasksInWindow.length > 0 ?
+        longTasksInWindow[longTasksInWindow.length - 1].end : searchBegin;
+
+    if ((windowEnd - possibleFirstInteractive) >= interactiveWindowSizeMs) {
+      return possibleFirstInteractive;
+    }
+
+    return null;
+  }
+
+  function getFIForwardNetwork(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow} = kwargs;
+
+    const longTasksInWindow = mainThreadTasks.filter(task =>
+        task.duration >= 50 &&
+        searchBegin <= task.end &&
+        task.start <= windowEnd);
+
+    const requestsInSearchSpace = requestsInWindow.filter(req =>
+        searchBegin <= req.end && req.start <= windowEnd);
+
+    // timestamps of interest
+    const endpoints = [];
+
+    for (const task of longTasksInWindow) {
+      endpoints.push({
+        time: task.start,
+        type: "taskStart",
+        slice: task
+      });
+      endpoints.push({
+        time: task.end,
+        type: "taskEnd",
+        slice: task
+      });
+    };
+
+    for (const req of requestsInSearchSpace) {
+      endpoints.push({
+        time: req.start,
+        type: "requestStart",
+        slice: req
+      });
+      endpoints.push({
+        time: req.end,
+        type: "requestEnd",
+        slice: req
+      });
+    }
+
+    endpoints.sort((a, b) => a.time - b.time);
+
+    let quietWindowStart = searchBegin;
+    let activeNetworkRequests = 0;
+
+    for (const timestamp of endpoints) {
+      switch(timestamp.type) {
+        case "taskStart":
+          if (timestamp.time - quietWindowStart >= interactiveWindowSizeMs &&
+              activeNetworkRequests <= activeRequestTolerance) {
+            return quietWindowStart;
+          }
+          quietWindowStart = Math.max(quietWindowStart, timestamp.slice.end);
+          break;
+        case "taskEnd":
+          // Nothing to do.
+          break;
+        case "requestStart":
+          activeNetworkRequests++;
+          break;
+        case "requestEnd":
+          // First check if we just exited a period of network business.
+          if (activeNetworkRequests > activeRequestTolerance) {
+            quietWindowStart = Math.max(quietWindowStart, timestamp.time);
+          }
+          activeNetworkRequests--;
+          break;
+      }
+    }
+
+    if (windowEnd - quietWindowStart >= interactiveWindowSizeMs &&
+        activeNetworkRequests <= activeRequestTolerance) {
+      return quietWindowStart;
+    }
+
+    return null;
+  }
+
+  function getFIReverseFromNetworkFI(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow} = kwargs;
+
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    const kwargsCopy = Object.assign({}, kwargs);
+    kwargsCopy[windowEnd] = forwardNetworkFI + interactiveWindowSizeMs + epsilon;
+    const refinedFI = getFIReverseSearch(kwargsCopy);
+
+    // Sanity check: In the worst case, refinedFirstInteractive should be the
+    // same as original firstInteractive.
+    if (refinedFI === null) throw Error("This should never happen");
+
+    return refinedFI;
+  }
+
+  /* Commenting this out for now. Uncomment estimated_queuing_time import if
+   * you're uncommenting this.
+
+
+  // This is the one where we search backwards from network TTI, but instead of
+  // strictly looking for long tasks, we look for windows with high EQT.
+  function getFIRevFromNetFIHighEqtWindow(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, eqtWindowSize, eqtThreshold} = kwargs;
+
+    // Get the network forward search firstInteractive.
+    // This is the right boundary of our quest for firstInteractive
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    // We're now only interested in the [searchBegin, forwardNetworkFI] range.
+    const startTime = searchBegin;
+    const endTime = forwardNetworkFI;
+
+    // In case the site has no window of high enough EQT, we start off assuming
+    // the site was always interactive, i.e. firstInteractive happens at the
+    // beginning of our search window.
+    let firstInteractive = searchBegin;
+
+    // All tasks in our current range of interest.
+    var tasks = mainThreadTasks.filter(
+        t => t.end >= startTime &&
+        t.start <= endTime);
+
+    var endpoints = [];
+    endpoints.push(startTime);
+    endpoints.push(endTime - eqtWindowSize);
+    for (var task of tasks) {
+      endpoints.push(task.start - eqtWindowSize);
+      endpoints.push(task.start);
+      endpoints.push(task.end - eqtWindowSize);
+      endpoints.push(task.end);
+    }
+    endpoints = endpoints.filter(
+      x => (startTime <= x && x + eqtWindowSize <= endTime));
+    // Sort in Descending order
+    endpoints.sort((a, b) => b - a);
+
+    var slidingWindow = new tr.e.chrome.SlidingWindow(
+      endpoints[0], eqtWindowSize, tasks);
+
+    for (var endpoint of endpoints) {
+      slidingWindow.slideBackwards(endpoint);
+      if (slidingWindow.getEQT > eqtThreshold) {
+        firstInteractive = slidingWindow.range.max;
+        break;
+      }
+    }
+
+    return firstInteractive;
+  }
+
+  */
+
+  function getFIForwardSlideInHighEQTWindow(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, eqtWindowSize, eqtThreshold} = kwargs;
+
+    const backwardHighEQTFI = getFIRevFromNetFIHighEqtWindow(kwargs);
+    if (backwardHighEQTFI === null) return null;
+    const firstInteractiveFirst = getFISimpleForwardSearch({
+      searchBegin: Math.max(backwardHighEQTFI - eqtWindowSize, searchBegin),
+      windowEnd: windowEnd,
+      mainThreadTasks: mainThreadTasks,
+      interactiveWindowSizeMs: 100
+    })
+    if (firstInteractiveFirst === null) return null;
+    const firstInteractiveSecond = getFISimpleForwardSearch({
+      searchBegin: firstInteractiveFirst,
+      windowEnd: windowEnd,
+      mainThreadTasks: mainThreadTasks,
+      interactiveWindowSizeMs: 10,
+      longTaskThreshold: 5
+    })
+
+    return firstInteractiveSecond;
+  }
+
+  function isLonely(longTasks, index, windowSize) {
+    if (index >= longTasks.length || index < 0) {
+      throw Error("index not in longTasks array");
+    }
+
+    const currTask = longTasks[index];
+    const nextTask = index + 1 === longTasks.length
+          ? null : longTasks[index + 1];
+    const prevTask = index === 0
+          ? null : longTasks[index - 1];
+
+    const lonelyForward =
+          nextTask === null
+          || nextTask.start - currTask.end > windowSize;
+    const lonelyBackward =
+          prevTask === null
+          || currTask.start - prevTask.end >= windowSize;
+
+    return lonelyForward && lonelyBackward;
+  }
+
+  function getFINetRevLonelyTask(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, lonelyWindowPaddingMs,
+           longTaskAbsoluteThreshold} = kwargs;
+
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    const longTasksUntilNetFI = mainThreadTasks.filter(t =>
+        t.duration >= 50 &&
+        t.end >= searchBegin &&
+        t.start <= forwardNetworkFI
+    );
+
+    if (longTasksUntilNetFI.length === 0) return searchBegin;
+
+    let i = longTasksUntilNetFI.length - 1;
+    while(i >= 0) {
+      // Stop if current task is too long
+      if (longTasksUntilNetFI[i].duration > longTaskAbsoluteThreshold) break;
+      // Stop if current task has another long task nearby
+      if (!isLonely(longTasksUntilNetFI, i, lonelyWindowPaddingMs)) break;
+      i--;
+    }
+
+    return i < 0 ? searchBegin : longTasksUntilNetFI[i].end;
+  }
+
+  function getFINetRevLonelyWindow(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           interactiveWindowSizeMs, activeRequestTolerance,
+           requestsInWindow, lonelyWindowSizeMs,
+           lonelyWindowPaddingMs, paddingFromSearchBegin} = kwargs;
+
+    const forwardNetworkFI = getFIForwardNetwork(kwargs);
+    if (forwardNetworkFI == null) return null;
+
+    const longTasksUntilNetFI = mainThreadTasks.filter(t =>
+        t.duration >= 50 &&
+        t.end >= searchBegin &&
+        t.start <= forwardNetworkFI
+    );
+
+    if (longTasksUntilNetFI.length === 0) return searchBegin;
+
+    let i = longTasksUntilNetFI.length - 1;
+    let firstInteractive = undefined;
+    while(i >= 0) {
+      // If task is longer than our lonely window, clearly there is no window
+      // that will envelop this long task.
+      if (longTasksUntilNetFI[i].duration >= lonelyWindowSizeMs) {
+        const task = longTasksUntilNetFI[i];
+        const taskStart = task.start;
+        const taskEnd = task.end;
+        consoleLog(`Task at [${taskStart}, ${taskEnd}] too big to envelop`);
+        firstInteractive = longTasksUntilNetFI[i].end;
+        break;
+      }
+
+      // Right boundary of lonely window.
+      const lonelyWindowEnd = longTasksUntilNetFI[i].end;
+
+      // Iterate backward to find the first long task before the lonely window.
+      // i--;  // Loop body guarantees one decrement.
+      let firstTaskIndexInWindow = i;
+      let lastTaskIndexBeforeWindow = firstTaskIndexInWindow - 1;
+
+      const envelopCanGrow = lastTaskIndexBeforeWindow => {
+        const taskBeforeWindow = longTasksUntilNetFI[lastTaskIndexBeforeWindow];
+        return (lonelyWindowEnd - taskBeforeWindow.start) < lonelyWindowSizeMs;
+      }
+
+      while (lastTaskIndexBeforeWindow >= 0
+           && envelopCanGrow(lastTaskIndexBeforeWindow)) {
+        firstTaskIndexInWindow -= 1;
+        lastTaskIndexBeforeWindow = firstTaskIndexInWindow - 1;
+      }
+
+      // Make lonely window should be as tight as possible, so it starts at the
+      // beginning of the first long task in the window.
+      const lonelyWindowStart = longTasksUntilNetFI[firstTaskIndexInWindow].start;
+
+      // Last point before the start of lonely window when the main thread had a
+      // long task. If there is no such long task, use searchBegin.
+      const previousBusyTimestamp = lastTaskIndexBeforeWindow >= 0 ?
+            longTasksUntilNetFI[lastTaskIndexBeforeWindow].end : searchBegin;
+
+      if (lonelyWindowStart - previousBusyTimestamp <= lonelyWindowPaddingMs) {
+        consoleLog(`Window not forgiven: [${lonelyWindowStart},` +
+            ` ${lonelyWindowEnd}] because previous busy timestamp ` +
+            `${previousBusyTimestamp} is too close.`);
+        firstInteractive = lonelyWindowEnd;
+        break;
+      }
+
+      if (lonelyWindowStart - searchBegin <= paddingFromSearchBegin) {
+        consoleLog(`Window not forgiven: [${lonelyWindowStart},` +
+                ` ${lonelyWindowEnd}] because searchBegin ` +
+                   `${searchBegin} is too close.`);
+        firstInteractive = lonelyWindowEnd;
+        break;
+      }
+
+      consoleLog(`Window forgiven: [${lonelyWindowStart}, ${lonelyWindowEnd}]`);
+      i = lastTaskIndexBeforeWindow;
+    }
+
+    return i < 0 ? searchBegin : firstInteractive;
+  }
+
+  function getFIEventListeners(kwargs) {
+    const {searchBegin, windowEnd, updateCounters,
+        eventListenerThreshold} = kwargs;
+
+    // If there's a long gap after the last registered event listener, include it.
+    updateCounters.push({ts:windowEnd, listeners:0, synthetic:true})
+
+    // Ignore changes before searchBegin.
+    while(updateCounters[0].ts < searchBegin) {
+      updateCounters.shift();
+    }
+
+    let previousCounter = updateCounters[0];
+    for (let counter of updateCounters.slice(1)) {
+      if (counter.ts - previousCounter.ts > eventListenerThreshold) {
+        return previousCounter.ts;
+      }
+      if (previousCounter.listeners != counter.listeners) {
+        previousCounter = counter;
+      }
+    }
+
+    return null;
+  }
+
+  function getFIProportionalAndLonely(kwargs) {
+    const {searchBegin, windowEnd, mainThreadTasks,
+           windowIsQuiet, lonelyWindowSizeMs,
+           lonelyWindowPaddingMs, paddingFromSearchBegin} = kwargs;
+
+    const longTasksInWindow = mainThreadTasks.filter(t =>
+        t.duration >= 50 &&
+        t.end >= searchBegin &&
+        t.start <= windowEnd
+    );
+
+    const getLonelyIndices = () => {
+      let lonelyIndices = [];
+      let i = 0;
+      while (i < longTasksInWindow.length) {
+        const currTask = longTasksInWindow[i];
+        if (currTask.start < searchBegin + paddingFromSearchBegin) {
+          i++;
+          continue;
+        }
+
+        const quietWindowStart = i === 0 ? searchBegin
+              : longTasksInWindow[i - 1].end;
+        if ((currTask.start - quietWindowStart) < lonelyWindowPaddingMs) {
+          i++;
+          continue;
+        }
+
+        if (currTask.duration > lonelyWindowPaddingMs) {
+          i++;
+          continue;
+        }
+
+        const lonelyWindowStart = currTask.start;
+        let lastTaskIndexInWindow = i;
+
+        const envelopCanGrow = lastTaskIndexInWindow => {
+          if (lastTaskIndexInWindow + 1 === longTasksInWindow.length) {
+            return false;
+          }
+
+          const nextTask = longTasksInWindow[lastTaskIndexInWindow + 1];
+          if (nextTask.end - lonelyWindowStart > lonelyWindowSizeMs) {
+            return false;
+          }
+
+          return true;
+        }
+
+        while (envelopCanGrow(lastTaskIndexInWindow)) {
+          lastTaskIndexInWindow++;
+        }
+
+        const lonelyWindowEnd = longTasksInWindow[lastTaskIndexInWindow].end;
+        const firstTaskIndexBeyondWindow = lastTaskIndexInWindow + 1;
+        const nextEndpoint = firstTaskIndexBeyondWindow === longTasksInWindow.length
+            ? windowEnd : longTasksInWindow[firstTaskIndexBeyondWindow].start;
+        if (nextEndpoint - lonelyWindowEnd > lonelyWindowPaddingMs) {
+          // The tasks inside the envelope are now officially lonely.
+          for (let j = i; j < firstTaskIndexBeyondWindow; j++) {
+            lonelyIndices.push(j);
+          }
+          i = firstTaskIndexBeyondWindow;
+        } else {
+          i++;
+        }
+      }
+      return new Set(lonelyIndices);
+    }
+
+    if (longTasksInWindow.length === 0) return searchBegin;
+
+    // Find task indices that can be excluded.
+    const lonelyIndices = getLonelyIndices();
+    let firstInteractive = undefined;
+    let quietWindowStart = searchBegin;
+    for (let i = 0; i < longTasksInWindow.length; i++) {
+      if (lonelyIndices.has(i)) continue;
+
+      const task = longTasksInWindow[i];
+      if (windowIsQuiet(quietWindowStart, task.start, searchBegin)) {
+        return quietWindowStart;
+      }
+      quietWindowStart = task.end;
+    }
+
+    if (windowIsQuiet(quietWindowStart, windowEnd, searchBegin)) {
+      return quietWindowStart;
+    }
+
+    return null;
+  }
+
+  function getNetworkRequests(rendererHelper) {
+    return rendererHelper.mainThread.asyncSliceGroup.slices.filter(slice =>
+        slice.title === 'ResourceLoad');
+  }
+
+  function getActiveNetworkRequests(timestamp, networkRequests) {
+    // Brute force algortihm for finding number of active network requests at a
+    // given timestamp. Eventually we should optimize this, perhaps using an
+    // interval tree.
+    var activeRequests = [];
+    for (var req of networkRequests) {
+      // If a req begins at timestamp, count it as an active request.
+      // If a req ends at timestamp, do not count it as an active request.
+      if (req.start <= timestamp && timestamp < req.end) activeRequests.push(req);
+    }
+    return activeRequests;
+  }
+
+  function getInteractivePeriodBeginnings(
+    firstCandidate, taskWindowEnd, longTasks, interactiveWindowSizeMs) {
+    var longTasksInWindow = longTasks.filter(task =>
+        firstCandidate <= task.end && task.start <= taskWindowEnd);
+
+    var interactivePeriodBeginnings = [];
+
+    var quietWindowStart = firstCandidate;
+    for (var task of longTasksInWindow) {
+      if ((task.start - quietWindowStart) > interactiveWindowSizeMs) {
+        interactivePeriodBeginnings.push(quietWindowStart);
+      }
+      quietWindowStart = task.end;
+    }
+
+    if ((taskWindowEnd - quietWindowStart) > interactiveWindowSizeMs) {
+      interactivePeriodBeginnings.push(quietWindowStart);
+    }
+
+    return interactivePeriodBeginnings;
+  }
+
+  // Duplicated code from network reverse search to use in the eqt based optimistic tti.
+  function findNetworkReverseSearchFirstInteractive(
+      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSizeMs) {
+    var firstInteractive = findFirstIneractiveInRangeForwardSearchNetwork(
+      firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSizeMs);
+
+    if (firstInteractive !== null) {
+      // Now do a reverseSearch.
+      var smallEpsilon = 0.1  // Used to counter floating point errors.
+      var refinedFirstInteractive = findFirstIneractiveInRangeReverseSearch(
+        firstCandidate, firstInteractive + interactiveWindowSizeMs + smallEpsilon, longTasks, interactiveWindowSizeMs);
+      if (refinedFirstInteractive === null) {
+        // In the worst case, refinedFirstInteractive should be the same as original
+        // firstInteractive.
+        throw Error("This should never happen");
+      }
+      return refinedFirstInteractive;
+    }
+
+    return null;
+  }
+
+  // This assumes no partial tasks in window
+  function getEQT(mainThreadTasks, windowStart, windowEnd) {
+    var tasksInWindow = mainThreadTasks.filter(t => t.start >= windowStart && t.end <= windowEnd);
+    var windowSize = windowEnd - windowStart;
+    var eqt = 0;
+    for (var t of tasksInWindow) {
+      // eqt += probability of landing on task * mean eqt if landed on task
+      eqt += (t.duration / windowSize) * (t.duration / 2);
+    }
+    return eqt;
+  }
+
+  function getMainThreadTopLevelEventDurations(startTime, endTime, mainThread) {
+    // Find durations of all slices in range of interest.
+    // TODO(bckenny): filter for top level slices ourselves?
+    const durations = [];
+    let clippedLength = 0;
+    mainThread.sliceGroup.topLevelSlices.forEach(slice => {
+      // Discard slices outside range.
+
+      if (slice.end <= startTime || slice.start >= endTime) {
+        return;
+      }
+
+      // Clip any at edges of range.
+      let duration = slice.duration;
+      let sliceStart = slice.start;
+      if (sliceStart < startTime) {
+        // Any part of task before window can be discarded.
+        sliceStart = startTime;
+        duration = slice.end - sliceStart;
+      }
+      if (slice.end > endTime) {
+        // Any part of task after window must be clipped but accounted for.
+        clippedLength = duration - (endTime - sliceStart);
+      }
+
+      durations.push(duration);
+    });
+    durations.sort((a, b) => a - b);
+
+    return {
+      durations,
+      clippedLength
+    };
+  }
+
+  /**
+   * Calculate duration at specified percentiles for given population of
+   * durations.
+   * If one of the durations overlaps the end of the window, the full
+   * duration should be in the duration array, but the length not included
+   * within the window should be given as `clippedLength`. For instance, if a
+   * 50ms duration occurs 10ms before the end of the window, `50` should be in
+   * the `durations` array, and `clippedLength` should be set to 40.
+   * @see https://docs.google.com/document/d/1b9slyaB9yho91YTOkAQfpCdULFkZM9LqsipcX3t7He8/preview
+   * @param {!Array<number>} durations Array of durations, sorted in ascending order.
+   * @param {number} totalTime Total time (in ms) of interval containing durations.
+   * @param {!Array<number>} percentiles Array of percentiles of interest, in ascending order.
+   * @param {number=} clippedLength Optional length clipped from a duration overlapping end of window. Default of 0.
+   * @return {!Array<{percentile: number, time: number}>}
+   * @private
+   */
+  function _riskPercentiles(durations, totalTime, percentiles, clippedLength = 0) {
+    const BASE_RESPONSE_LATENCY = 16.0;
+    let busyTime = 0;
+    for (let i = 0; i < durations.length; i++) {
+      busyTime += durations[i];
+    }
+    busyTime -= clippedLength;
+
+    // Start with idle time already complete.
+    let completedTime = totalTime - busyTime;
+    let duration = 0;
+    let cdfTime = completedTime;
+    const results = [];
+
+    let durationIndex = -1;
+    let remainingCount = durations.length + 1;
+    if (clippedLength > 0) {
+      // If there was a clipped duration, one less in count since one hasn't started yet.
+      remainingCount--;
+    }
+
+    // Find percentiles of interest, in order.
+    for (const percentile of percentiles) {
+      // Loop over durations, calculating a CDF value for each until it is above
+      // the target percentile.
+      const percentileTime = percentile * totalTime;
+      while (cdfTime < percentileTime && durationIndex < durations.length - 1) {
+        completedTime += duration;
+        remainingCount -= (duration < 0 ? -1 : 1);
+
+        if (clippedLength > 0 && clippedLength < durations[durationIndex + 1]) {
+          duration = -clippedLength;
+          clippedLength = 0;
+        } else {
+          durationIndex++;
+          duration = durations[durationIndex];
+        }
+
+        // Calculate value of CDF (multiplied by totalTime) for the end of this duration.
+        cdfTime = completedTime + Math.abs(duration) * remainingCount;
+      }
+
+      // Negative results are within idle time (0ms wait by definition), so clamp at zero.
+      results.push({
+        percentile,
+        time: Math.max(0, (percentileTime - completedTime) / remainingCount) + BASE_RESPONSE_LATENCY
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Calculates the maximum queueing time (in ms) of high priority tasks for
+   * selected percentiles within a window of the main thread.
+   * @see https://docs.google.com/document/d/1b9slyaB9yho91YTOkAQfpCdULFkZM9LqsipcX3t7He8/preview
+   * @param {!traceviewer.Model} model
+   * @param {{traceEvents: !Array<!Object>}} trace
+   * @param {number=} startTime Optional start time (in ms) of range of interest. Defaults to trace start.
+   * @param {number=} endTime Optional end time (in ms) of range of interest. Defaults to trace end.
+   * @param {!Array<number>=} percentiles Optional array of percentiles to compute. Defaults to [0.5, 0.75, 0.9, 0.99, 1].
+   * @return {!Array<{percentile: number, time: number}>}
+   */
+  function getRiskToResponsiveness(startTime, endTime, percentiles, mainThread) {
+    // Range of responsiveness we care about. Default to bounds of model.
+    startTime = startTime === undefined ? model.bounds.min : startTime;
+    endTime = endTime === undefined ? model.bounds.max : endTime;
+    const totalTime = endTime - startTime;
+    if (percentiles) {
+      percentiles.sort((a, b) => a - b);
+    } else {
+      percentiles = [0.5, 0.75, 0.9, 0.99, 1];
+    }
+
+    const ret = getMainThreadTopLevelEventDurations(startTime, endTime, mainThread);
+    return _riskPercentiles(ret.durations, totalTime, percentiles,
+                            ret.clippedLength);
+  }
+  // END FROM LIGHTHOUSE
+
+  function getFILighthouse(kwargs) {
+    const {searchBegin, endOfTraceTime, mainThreadTasks, model, mainThread} = kwargs;
+
+    // From lighthouse (https://github.com/GoogleChrome/lighthouse/blob/338b09eb3c4275a1609fd1136b5818a917223137/lighthouse-core/audits/time-to-interactive.js)
+
+    // Find first 500ms window where Est Input Latency is <50ms at the 90% percentile.
+    let startTime = searchBegin
+    let endTime;
+    let currentLatency = Infinity;
+    const percentiles = [0.9]; // [0.75, 0.9, 0.99, 1];
+    const threshold = 50;
+    const foundLatencies = [];
+
+    // When we've found a latency that's good enough, we're good.
+    while (currentLatency > threshold) {
+      // While latency is too high, increment just 50ms and look again.
+      startTime += 50;
+      endTime = startTime + 500;
+      // If there's no more room in the trace to look, we're done.
+      if (endTime > endOfTraceTime) {
+        throw new Error('Entire trace was found to be busy.');
+      }
+      // Get our expected latency for the time window
+      const latencies = getRiskToResponsiveness(startTime, endTime, percentiles, mainThread);
+      const estLatency = latencies[0].time;
+      foundLatencies.push({
+        estLatency: estLatency,
+        startTime: startTime.toFixed(1)
+      });
+
+      // Grab this latency and try the threshold again
+      currentLatency = estLatency;
+    }
+    // The start of our window is our TTI
+    return startTime;
+  }
+
+  // This is the one where we look at the EQT between two potential
+  // firstInteractive candidates and if the EQT is low enough we take the
+  // earlier one. Currently unused but code not deleted because the code can
+  // potentially be useful later.
+  function calculateFirstInteractiveNetRevEQT(
+      navStartTimestamps, firstCandidates, networkRequests, longTasks, traceEnd, interactiveWindowSizeMs,
+      mainThreadTasks) {
+
+    if (navStartTimestamps.length === 0 || firstCandidates.length === 0) return null;
+
+    for (var i = 0; i < navStartTimestamps.length; i++) {
+      // Get our window of interest. A window begings at a navigationStart, and
+      // ends either at the next navigationStart, and when we reach end of
+      // tracing.
+      var taskWindowStart = navStartTimestamps[i];
+      var taskWindowEnd = i + 1 < navStartTimestamps.length ?
+          navStartTimestamps[i + 1] : traceEnd;
+
+      // Get the firstInteractive candidates that lie within the current window.
+      var firstCandidatesInWindow = firstCandidates.filter(candidate =>
+          taskWindowStart <= candidate && candidate < taskWindowEnd);
+
+      // We make sure we have only one firstCandidate (e.g. FMP/FCP/DCL) in our
+      // window. If we find more than one, this is probably a bug and it's best to bail.
+      if (firstCandidatesInWindow.length > 1) return null;
+      if (firstCandidatesInWindow.length == 0) continue;
+      var firstCandidate = firstCandidatesInWindow[0];
+
+      // Get all forward search firstInteractives with 1s window in given range.
+      var interactivePeriodBeginnings = getInteractivePeriodBeginnings(
+        firstCandidate, taskWindowEnd, longTasks, 1000);
+
+      // Get the network reverse search firstInteractive.
+      // This is the right boundary of our quest for firstInteractive
+      var networkReverseFirstInteractive = findNetworkReverseSearchFirstInteractive(
+        firstCandidate, taskWindowEnd, longTasks, networkRequests, interactiveWindowSizeMs);
+
+      // We don't really care about interactiveBeginnings beyond networkReverseFirstInteractive
+      // Fingers crossed we don't get bit by floating point errors.
+      // I don't want to preemptively add an epsilon here, but pls do if bugs show up
+      interactivePeriodBeginnings = interactivePeriodBeginnings.filter(
+          t => t <= networkReverseFirstInteractive);
+
+      if (interactivePeriodBeginnings.length === 0) return null;
+      if (networkReverseFirstInteractive === null) return null;
+      // console.log(interactivePeriodBeginnings);
+      // console.log(networkReverseFirstInteractive);
+      if (interactivePeriodBeginnings[interactivePeriodBeginnings.length - 1] !== networkReverseFirstInteractive) {
+        throw new Error("This should not happen");
+      }
+
+      // TODO: Now starting from the end, see if EQT between two interactive points is lower than 25ms.
+      var j = interactivePeriodBeginnings.length - 1;
+      for (var j = interactivePeriodBeginnings.length - 1; j >= 1; j--) {
+        // This gets the EQT (as in mean Queuing Time - not a percentile)
+        // between the two interactive beginnings.
+        // Since we know window start and ends are both ends of long tasks,
+        // we do not have to deal with window clippings
+        var eqt = getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1], interactivePeriodBeginnings[j]);
+        // console.log(`EQT between ${interactivePeriodBeginnings[j]} and ${interactivePeriodBeginnings[j - 1]}: ${eqt}`);
+        if (getEQT(mainThreadTasks, interactivePeriodBeginnings[j - 1],
+            interactivePeriodBeginnings[j]) > 25) {
+          return interactivePeriodBeginnings[j];
+        }
+      }
+    }
+
+    return interactivePeriodBeginnings[0];
+  }
+
+  function findMainLoadingFrames(traceObjects) {
+    var frameLoaderInstances = traceObjects.instancesByTypeName_['FrameLoader'];
+    var mainFrames = [];
+    for (var frameLoaderInstance of frameLoaderInstances) {
+      if (frameLoaderInstance.modelItem.snapshots.length > 0 &&
+          frameLoaderInstance.modelItem.snapshots[0].isLoadingMainFrame) {
+        mainFrames.add
+      }
+    }
+    frameLoaderInstances.map(oi => oi.modelItem.snapshots.map(s => s.args.isLoadingMainFrame))
+  }
+
+  // Only returns navigationStart events for the main loading frame
+  function getMainFrameNavStartEvents(rendererHelper) {
+    return getNavStartEvents(rendererHelper).filter(event => {
+      var frameIdRef = event.args['frame'];
+      var snapshot = findFrameLoaderSnapshotAt(rendererHelper, frameIdRef, event.start);
+      return snapshot && snapshot.args.isLoadingMainFrame;
+    });
+  }
+
+  function getNavStartTimesByFrame(navStartEvents) {
+    var navStartTimesByFrame = new Map();
+    for (var e of navStartEvents) {
+      var navStartTimestamps = navStartTimesByFrame.get(e.args.frame) || [];
+      navStartTimestamps.push(e.start);
+      navStartTimesByFrame.set(e.args.frame, navStartTimestamps);
+    }
+    return navStartTimesByFrame;
+  }
+
+  function getFMPTimestampsByFrame(fmpSamples) {
+    var fmpTimestampsByFrame = new Map();
+    for (var sample of fmpSamples) {
+      var frame = sample.diagnostics['Navigation infos'].value.frame;
+      var time = sample.diagnostics['Navigation infos'].value.fmp;
+      var fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
+      fmpTimestamps.push(time);
+      fmpTimestampsByFrame.set(frame, fmpTimestamps);
+    }
+    return fmpTimestampsByFrame;
+  }
+
+  function getFCPTimestampsByFrame(fcpSamples) {
+    var fcpTimestampsByFrame = new Map();
+    for (var sample of fcpSamples) {
+      var frame = sample.diagnostics.frame.value;
+      var time = sample.diagnostics.eventTimestamp.value;
+      var fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
+      fcpTimestamps.push(time);
+      fcpTimestampsByFrame.set(frame, fcpTimestamps);
+    }
+    return fcpTimestampsByFrame;
+  }
+
+  function getUniqueInWindow(ts, windowStart, windowEnd) {
+    const filteredTs = ts.filter(t => windowStart <= t && t < windowEnd);
+
+    // We make sure we have only one ts (which is usually FMP/FCP) in
+    // our window. If we find more than one, this is probably a bug and
+    // it's best to fail loudly and figure out the underlying issue.
+    if (filteredTs.length > 1) throw Error("More than one");
+    if (filteredTs.length == 0) return null;
+
+    return filteredTs[0];
+  }
+
+  // This returns undefined if there is none is window.
+  function getFirstInWindow(ts, windowStart, windowEnd) {
+    const filteredTs = ts.filter(t => windowStart <= t && t <= windowEnd);
+    return filteredTs[0];
+  }
+
+  // This returns undefined if there is none is window.
+  function getLastInWindow(ts, windowStart, windowEnd) {
+    const filteredTs = ts.filter(t => windowStart <= t && t <= windowEnd);
+    return filteredTs[filteredTs.length - 1];
+  }
+
+  function anyNull(xs) {
+    for (const x of xs) if (x === null) return true;
+    return false;
+  }
+
+  function addExperimentalFirstInteractiveHistograms(histogramMap, loadingMetrics, rendererHelper) {
+    const navStartEvents = getMainFrameNavStartEvents(rendererHelper).filter(event => {
+      // Only find navigationStart events for the main loading frame
+      var frameIdRef = event.args['frame'];
+      var snapshot = findFrameLoaderSnapshotAt(rendererHelper, frameIdRef, event.start);
+      return snapshot && snapshot.args.isLoadingMainFrame;
+    });
+    navStartEvents.sort((a, b) => a.start - b.start);
+
+    const navStartTimesByFrame = getNavStartTimesByFrame(navStartEvents);
+    const fmpTimestampsByFrame =
+        getFMPTimestampsByFrame(loadingMetrics.firstMeaningfulPaintSamples);
+    const fcpTimestampsByFrame =
+        getFCPTimestampsByFrame(loadingMetrics.firstContentfulPaintSamples);
+
+    const dclTimestampsByFrame = getDCLTimestampsByFrame(rendererHelper);
+    consoleLog('dclTimestampsByFrame', dclTimestampsByFrame);
+
+    const networkRequests = getNetworkRequests(rendererHelper);
+    networkRequests.sort((a, b) => a.end - b.end);
+
+    const updateCounters = rendererHelper.mainThread.sliceGroup.slices.
+        filter(x => x.title == "UpdateCounters").
+        map(x => ({ts : x.start, listeners: x.args.data.jsEventListeners}));
+
+    const mainThreadTasks = [];
+    for (var e of rendererHelper.mainThread.sliceGroup.childEvents()) {
+      if (e.title === 'TaskQueueManager::ProcessTaskFromWorkQueue') {
+        mainThreadTasks.push(e);
+      }
+    }
+    mainThreadTasks.sort((a, b) => a.start - b.start);
+
+    var traceEnd = rendererHelper.modelHelper.model.bounds.max;
+
+    for (const [frame, navStartTimestamps] of navStartTimesByFrame) {
+      const fmpTimestamps = fmpTimestampsByFrame.get(frame) || [];
+      const fcpTimestamps = fcpTimestampsByFrame.get(frame) || [];
+      const dclTimestamps = dclTimestampsByFrame.get(frame) || [];
+
+      for (let i = 0; i < navStartTimestamps.length; i++) {
+        // Get our window of interest. A window begins at a navigationStart, and
+        // ends either at the next navigationStart, and when we reach end of
+        // tracing.
+        const windowStart = navStartTimestamps[i];
+        const windowEnd = i + 1 < navStartTimestamps.length ?
+            navStartTimestamps[i + 1] : traceEnd;
+
+        const getUniqueInCurrentWindow = ts => getUniqueInWindow(ts, windowStart, windowEnd);
+
+        const fmp = getUniqueInCurrentWindow(fmpTimestamps);
+        const fcp = getUniqueInCurrentWindow(fcpTimestamps);
+
+        // For some strange reason, there seems is often a spurious DCL event
+        // miliseconds after navigationStart. This may be due to how devtools
+        // handled emulation. For now, hacking around this problem by filtering
+        // out DCL events within 10ms of navigationStart.
+        const filteredDCLEvents =
+            dclTimestamps.filter(
+                ts => (windowStart + 10 <= ts && ts <= windowEnd));
+
+        const dcl = getUniqueInCurrentWindow(filteredDCLEvents);
+
+        // We need this navigation to at least reach FCP, FMP, and DCL.
+        if (anyNull([fmp, fcp, dcl])) continue;
+
+        // This is a convenience variable so it's easy to tweak.
+        const firstInteractiveLowerBound = dcl;
+
+
+        // All metric calculations should be restricted to objects in the
+        // current window.
+        const tasksInWindow = mainThreadTasks.filter(t =>
+              windowStart <= t.end && t.start <= windowEnd);
+        const requestsInWindow = networkRequests.filter(r =>
+            windowStart <= r.end && r.start <= windowEnd);
+
+        // Convenient shortcut function.
+        // This function is a no-op if sample is null
+        const addWithDiagnostics = (name, sample) => {
+          const sampleWithDiagnostics = {
+            value: sample,
+            diagnostics: {
+              navigationStart: new tr.v.d.Generic(windowStart),
+              tti: new tr.v.d.Generic(sample - windowStart),
+              fmp: new tr.v.d.Generic(fmp),
+              fcp: new tr.v.d.Generic(fcp),
+              frameId: new tr.v.d.Generic(frame)
+            }
+          };
+          addSamplesToExperimentalHistograms(
+              [sampleWithDiagnostics], histogramMap, name);
+        }
+
+        addWithDiagnostics('firstInteractive-FMP',
+            getFISimpleForwardSearch({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000
+            }));
+
+        addWithDiagnostics('firstInteractive-MaxFmpDcl',
+            lowerBoundAtTimestamp(firstInteractiveLowerBound,
+                getFISimpleForwardSearch({
+                    searchBegin: fmp,
+                    windowEnd: windowEnd,
+                    mainThreadTasks: mainThreadTasks,
+                    interactiveWindowSizeMs: 5000
+                  })));
+
+        const genWindowIsQuietFn = (w0, w15, wInf) => {
+          return (windowStart, windowEnd, searchBegin) => {
+            const timeSinceSearchBegin = windowStart - searchBegin;
+
+            // Required window sizes at t = 0, 15, and infinity
+            const reqSizeAt0 = w0;
+            const reqSizeAt15 = w15;
+            const reqSizeAtInfinity = wInf;
+            const t  = windowStart - searchBegin;
+
+            // We solve for
+            // reqSize = a * e ^ (b * t) + c
+
+            // Assuming b is negative, use t -> infinity.
+            const c = reqSizeAtInfinity;
+
+            // Use t = 0ms
+            const a = reqSizeAt0 - c;
+
+
+            // We then obtain this plugging in t = 15000ms
+            const b = 1 / 15000 * Math.log((reqSizeAt15 - c) / a);
+
+
+            const reqSize = a * Math.exp(b * t) + c
+            // console.log("windowStart", windowStart);
+            // console.log('windowEnd', windowEnd);
+            // console.log('searchBegin', searchBegin);
+            // console.log('reqSize', reqSize);
+
+            return (windowEnd - windowStart) > reqSize;
+          };
+        }
+
+        for (let w15 = 3000; w15 > 1000; w15 -= 250) {
+          addWithDiagnostics('firstInteractive-FMP-Proportional-w15-' + w15,
+              lowerBoundAtTimestamp(firstInteractiveLowerBound,
+                  getFISimpleForwardSearch({
+                    searchBegin: fmp,
+                    windowEnd: windowEnd,
+                    mainThreadTasks: mainThreadTasks,
+                    interactiveWindowSizeMs: 5000,
+                    // isLongTaskFn: (task, searchBegin) => {
+                    //   const timeSinceSearchBegin = task.start - searchBegin;
+                    //   return task.duration
+                    //     > Math.max(50, timeSinceSearchBegin / 1000 * 10);
+                    // },
+                    windowIsQuietFn: genWindowIsQuietFn(5000, w15, 1000)
+                  })));
+        }
+
+        addWithDiagnostics('firstInteractive-Lighthouse',
+            getFILighthouse({
+              searchBegin: firstInteractiveLowerBound,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              model: rendererHelper.modelHelper.model,
+              mainThread: rendererHelper.mainThread,
+            }));
+
+        for (let windowSize = 1000; windowSize <= 5000; windowSize += 1000) {
+          addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize + '-DCL',
+              lowerBoundAtTimestamp(firstInteractiveLowerBound,
+                  getFISimpleForwardSearch({
+                    searchBegin: fmp,
+                    windowEnd: windowEnd,
+                    mainThreadTasks: mainThreadTasks,
+                    interactiveWindowSizeMs: windowSize
+                  })));
+          addWithDiagnostics('firstInteractive-FMP-ws-' + windowSize,
+                getFISimpleForwardSearch({
+                  searchBegin: fmp,
+                  windowEnd: windowEnd,
+                  mainThreadTasks: mainThreadTasks,
+                  interactiveWindowSizeMs: windowSize
+                }));
+        }
+
+        // addWithDiagnostics('firstInteractive-FMP-1s',
+        //     getFILayeredForwardSearch({
+        //       searchBegin: fmp,
+        //       windowEnd: windowEnd,
+        //       mainThreadTasks: mainThreadTasks,
+        //       interactiveWindowSizeMs: 1000
+        //     }));
+
+
+        // addWithDiagnostics('firstInteractive-FCP',
+        //     getFISimpleForwardSearch({
+        //       searchBegin: fcp,
+        //       windowEnd: windowEnd,
+        //       mainThreadTasks: mainThreadTasks,
+        //       interactiveWindowSizeMs: 5000
+        //     }));
+
+        addWithDiagnostics('firstInteractive-EventListeners',
+            getFIEventListeners({
+              searchBegin: dcl,
+              windowEnd: windowEnd,
+              updateCounters: updateCounters,
+              eventListenerThreshold: 500
+            }));
+
+        addWithDiagnostics('firstInteractive-FMP-ReverseSearch',
+            getFIReverseSearch({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000
+            }));
+
+        // addWithDiagnostics('firstInteractive-FCP-ReverseSearch',
+        //     getFIReverseSearch({
+        //       searchBegin: fcp,
+        //       windowEnd: windowEnd,
+        //       mainThreadTasks: mainThreadTasks,
+        //       interactiveWindowSizeMs: 5000
+        //     }));
+
+        addWithDiagnostics('firstInteractive-FMP-Network',
+            getFIForwardNetwork({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000,
+              requestsInWindow: requestsInWindow,
+              activeRequestTolerance: 2
+            }));
+
+        addWithDiagnostics(
+            'firstInteractive-FMP-ReverseSearchFromNetworkFirstInteractive',
+            getFIReverseFromNetworkFI({
+              searchBegin: fmp,
+              windowEnd: windowEnd,
+              mainThreadTasks: mainThreadTasks,
+              interactiveWindowSizeMs: 5000,
+              requestsInWindow: requestsInWindow,
+              activeRequestTolerance: 2
+            }));
+
+        // for (let windowSize = 350; windowSize <= 500; windowSize += 50) {
+        //   for (let eqtThreshold = 8; eqtThreshold <= 12; eqtThreshold += 1) {
+        //     const metricName = 'firstInteractiveNetRevHighEQTWindow-' +
+        //         `ws-${windowSize}-et-${eqtThreshold}`;
+        //     addWithDiagnostics(metricName,
+        //         getFIRevFromNetFIHighEqtWindow({
+        //           searchBegin: fmp,
+        //           windowEnd: windowEnd,
+        //           mainThreadTasks: mainThreadTasks,
+        //           interactiveWindowSizeMs: 5000,
+        //           requestsInWindow: requestsInWindow,
+        //           activeRequestTolerance: 2,
+        //           eqtWindowSize: windowSize,
+        //           eqtThreshold: eqtThreshold
+        //         }));
+        //   }
+        // }
+
+        // addWithDiagnostics(
+        //   'firstInteractiveForwardSlideInHighEQTWindow',
+        //   getFIForwardSlideInHighEQTWindow({
+        //     searchBegin: fmp,
+        //     windowEnd: windowEnd,
+        //     mainThreadTasks: mainThreadTasks,
+        //     interactiveWindowSizeMs: 5000,
+        //     requestsInWindow: requestsInWindow,
+        //     activeRequestTolerance: 2,
+        //     // These valued looked good enough in brute force search
+        //     eqtWindowSize: 350,
+        //     eqtThreshold: 12
+        //   })
+        // );
+
+        addWithDiagnostics(
+          'firstInteractiveNetRevLonelyTask',
+          lowerBoundAtTimestamp(firstInteractiveLowerBound,
+              getFINetRevLonelyTask({
+                searchBegin: fmp,
+                windowEnd: windowEnd,
+                mainThreadTasks: mainThreadTasks,
+                interactiveWindowSizeMs: 5000,
+                requestsInWindow: requestsInWindow,
+                activeRequestTolerance: 2,
+                lonelyWindowPaddingMs: 1000,
+                longTaskAbsoluteThreshold: 200
+              })));
+
+        addWithDiagnostics(
+          'firstInteractiveNetRevLonelyWindow',
+          lowerBoundAtTimestamp(dcl, getFINetRevLonelyWindow({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            interactiveWindowSizeMs: 5000,
+            requestsInWindow: requestsInWindow,
+            activeRequestTolerance: 2,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000
+          }))
+        );
+
+        // for (let w15 = 1250; w15 < 3001; w15 += 250) {
+        //   for (const padding of [1000, 2000]) {
+        //     for (const lws of [150, 200, 250]) {
+        //       for (const psb of [0, 5000]) {
+        //         const m =
+        //           'firstInteractive-FMP-Proportional-w15-' + w15 +
+        //           '-lonely-ws-' + lws + '-padding-' + padding + 'psb-' + psb;
+        //         console.log(m);
+        //         addWithDiagnostics(
+        //           m,
+        //           lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+        //             searchBegin: fmp,
+        //             windowEnd: windowEnd,
+        //             mainThreadTasks: mainThreadTasks,
+        //             lonelyWindowPaddingMs: padding,
+        //             lonelyWindowSizeMs: lws,
+        //             paddingFromSearchBegin: psb,
+        //             windowIsQuiet: genWindowIsQuietFn(5000, w15, 1000)
+        //           }))
+        //         );
+        //       }
+        //     }
+        //   }
+        // }
+
+        addWithDiagnostics(
+          'firstInteractive-FMP-Proportional-w15-3000-lonely-ws-250-padding-1000psb-5000',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: genWindowIsQuietFn(5000, 3000, 1000)
+            })));
+
+        addWithDiagnostics(
+          'firstInteractive-FCP-Proportional-w15-3000-lonely-ws-250-padding-1000psb-5000',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+            searchBegin: fcp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: genWindowIsQuietFn(5000, 3000, 1000)
+          })));
+
+        addWithDiagnostics(
+          'firstInteractive-DCL-Proportional-w15-3000-lonely-ws-250-padding-1000psb-5000',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+            searchBegin: Math.max(fcp, dcl),
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: genWindowIsQuietFn(5000, 3000, 1000)
+          })));
+
+        addWithDiagnostics(
+          'firstInteractive-FMP-ForwardProportional',
+          lowerBoundAtTimestamp(dcl, getFIProportionalAndLonely({
+            searchBegin: fmp,
+            windowEnd: windowEnd,
+            mainThreadTasks: mainThreadTasks,
+            lonelyWindowPaddingMs: 1000,
+            lonelyWindowSizeMs: 250,
+            paddingFromSearchBegin: 5000,
+            windowIsQuiet: (windowStart, windowEnd) => (windowEnd - windowStart > 5000)
+          })));
+      }
+    }
+  }
+
+  function addExperimentalHistogramsToValues(values, histograms) {
+    for (var h of histograms.values()) {
+      values.addHistogram(h);
+    }
+  }
+
+  function loadingMetric(values, model) {
+    try {
+      var firstContentfulPaintHistogram = createHistogram(
+        'timeToFirstContentfulPaint');
+      firstContentfulPaintHistogram.description =
+        'time to first contentful paint';
+      var onLoadHistogram = createHistogram('timeToOnload');
+      onLoadHistogram.description = 'time to onload. ' +
+        'This is temporary metric used for PCv1/v2 sanity checking';
+      var firstMeaningfulPaintHistogram = createHistogram(
+        'timeToFirstMeaningfulPaint');
+      firstMeaningfulPaintHistogram.description =
+        'time to first meaningful paint';
+      var firstMeaningfulPaintCpuTimeHistogram = createHistogram(
+        'cpuTimeToFirstMeaningfulPaint');
+      firstMeaningfulPaintCpuTimeHistogram.description =
+        'CPU time to first meaningful paint';
+      var firstInteractiveHistogram = createHistogram('timeToFirstInteractive');
+      firstInteractiveHistogram.description = 'time to first interactive';
+
+      var chromeHelper = model.getOrCreateHelper(
+        tr.model.helpers.ChromeModelHelper);
+
+      const experimentalHistograms = new Map();
+
+      for (var pid in chromeHelper.rendererHelpers) {
+        var rendererHelper = chromeHelper.rendererHelpers[pid];
+        if (rendererHelper.isChromeTracingUI) continue;
+
+        var rendererLoadingMetrics = collectLoadingMetricsForRenderer(rendererHelper);
+        var {firstContentfulPaintSamples, onLoadSamples,
+             firstMeaningfulPaintSamples, firstMeaningfulPaintCpuTimeSamples,
+             firstInteractiveSamples} = rendererLoadingMetrics;
+
+        addSamplesToHistogram(firstContentfulPaintSamples,
+                              firstContentfulPaintHistogram);
+        addSamplesToHistogram(onLoadSamples, onLoadHistogram);
+        addSamplesToHistogram(firstMeaningfulPaintSamples,
+                              firstMeaningfulPaintHistogram);
+        addSamplesToHistogram(firstMeaningfulPaintCpuTimeSamples,
+                              firstMeaningfulPaintCpuTimeHistogram);
+        addSamplesToHistogram(firstInteractiveSamples,
+                              firstInteractiveHistogram);
+        addExperimentalFirstInteractiveHistograms(experimentalHistograms, rendererLoadingMetrics, rendererHelper);
+      }
+
+
+      values.addHistogram(firstContentfulPaintHistogram);
+      values.addHistogram(onLoadHistogram);
+      values.addHistogram(firstMeaningfulPaintHistogram);
+      values.addHistogram(firstInteractiveHistogram);
+
+      addExperimentalHistogramsToValues(values, experimentalHistograms);
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   tr.metrics.MetricRegistry.register(loadingMetric);
